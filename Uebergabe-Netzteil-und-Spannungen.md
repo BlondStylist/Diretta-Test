@@ -38,39 +38,35 @@ Schluss: Target-Netzteil regelt 2–3× schlechter, Nachschwingen, langsame Eige
 - Anschluss: **passives** Barrel→USB-C-Kabel (nur VBUS/GND, 5,5×2,1 mm, Mitte +) + `PSU_MAX_CURRENT=5000` im EEPROM. GPIO und PD-Adapter verworfen.
 - Vorbehalt: iFi-„<1 µV Rauschen" ist Ripple, nicht Lastregelung → Erfolg nur per Nachmessung belegt.
 
-## 5. Skript `psu_eeprom.sh` v1.2 (Review-Ergebnis)
+## 5. Skripte `vorbereiten.sh` + `psu_eeprom.sh` v1.3
 
-Datei: `psu_eeprom.sh` in diesem Repo. **SHA256:** `5844d868353633c7f60e3bd79252303dea0c546c0673ecea19a8909048174511`
+**Befund 29.09.2026 (echte Hardware):** `check` brach ab mit „Befehl fehlt: rpi-eeprom-config" – AudioLinux hat das Raspberry-Pi-Paket `rpi-eeprom` nicht installiert. Das Target ist nur über den Host erreichbar (172.20.0.2).
 
-Gegen den echten Upstream-Code (`raspberrypi/rpi-eeprom`, Stand 09/2026) und ein echtes Pi-5-Image (`pieeprom-2026-09-25.bin`) geprüft: `-d -i -f` ist die von Upstream selbst genutzte Aufrufform; shellcheck 0 Befunde; 5 Konfigurationsvarianten (mit/ohne `[all]`, vorhandener Wert, UTF-8, nur bedingte Sektion) im Roundtrip mit dem echten `rpi-eeprom-config` bestanden. **Weiterhin nie auf der realen Hardware gelaufen.**
+**Lösung v1.3:**
+- `vorbereiten.sh` läuft auf dem **Host**: liest die Bootloader-Version des Targets, lädt die offiziellen Werkzeuge (`rpi-eeprom-config/-update/-digest`, `recovery.bin`) und **genau das passende Bootloader-Image** von `raspberrypi/rpi-eeprom` (feste Version `ded1e93`, 91 Pi-5-Images 2023–2026, jede Datei per SHA256 geprüft), kopiert alles nach `~/rpi-eeprom/` auf dem Target und startet dort `check`.
+- `psu_eeprom.sh` nutzt dieses Bündel automatisch (prüft dessen Prüfsummen), meldet alle fehlenden Programme auf einmal, ersetzt `lspci` (nur Pi 4 relevant) und ggf. `strings` (über python3).
+- Ist die laufende Version nicht in der Liste, wird das neueste Standard-Image genommen und **vor dem Schreiben ausdrücklich** auf das zusätzliche Bootloader-Update hingewiesen.
 
-Korrekturen gegenüber v1.1:
+**Getestet** in einem nachgebauten Pi 5 (Device-Tree, Boot-Partition, vcgencmd simuliert; Werkzeuge und Images echt): vorbereiten → check → apply → Neustart-Simulation → verify (5000 mA) → rollback → verify: alles bestanden. Ebenso: fehlendes Bündel, manipuliertes Bündel, Version nicht in Liste (Update-Pfad), „Neustart ausstehend". shellcheck: 0 Befunde. Auf der realen Hardware nur bis zum Werkzeug-Abbruch gelaufen.
 
-1. **UTF-8 in Kommentaren** (z. B. „ü") brach ab, weil die Binärprüfung unter `LC_ALL=C` jedes Byte ≥ 0x80 ablehnte → jetzt nur echte Steuerzeichen.
-2. **`findmnt | tr | grep -q` unter `pipefail`**: potenzielles SIGPIPE-Fehlurteil („read-only") → ohne Pipe.
-3. **`verify`**: Referenz-Backup war „alphabetisch letztes mit APPLIED"; ein Rollback wurde nur im selben Ordner erkannt → jetzt neuester Marker (APPLIED/ROLLED_BACK) über alle Backups nach Zeitstempel.
-4. **`verify`**: warnt jetzt, wenn Device-Tree `max_current` ≠ 5000 mA.
-5. **Sofort-Update**: Upstream schreibt auf dem Pi 5 per `flashrom` **sofort**, wenn `flashrom` installiert ist (Standard `RPI_EEPROM_IMMEDIATE_UPDATE=1`). Das Skript meldet jetzt, welcher Modus greift; Neustart bleibt in beiden Fällen nötig.
-6. **Image-Mangel**: Bei fehlendem passendem Image werden alle vorhandenen Images samt Timestamp gelistet. Hinweis: Das Paket enthält aktuell Images bis **2026-09-25**; das „Juni-2024-Image" der Vorversion war nur eine Vermutung – der laufende Bootloader des Targets ist unbekannt, `check` zeigt ihn.
+SHA256 `psu_eeprom.sh`: `4b6df313161bd4877b6a5b3ce48c1f4150f68f6735fe54a5eded67e2c5863326` (wird von `vorbereiten.sh` automatisch geprüft).
 
-### Ablauf (Wiedergabe vorher stoppen)
+### Ablauf (auf dem Host, Wiedergabe vorher stoppen)
 
 ```bash
-scp psu_eeprom.sh diretta-target:psu_eeprom.sh
-ssh diretta-target 'sha256sum ~/psu_eeprom.sh'      # muss die Summe oben zeigen, sonst STOP
-ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh check'   # ändert nichts
+cd ~ && curl -fsSLO https://raw.githubusercontent.com/BlondStylist/Diretta-Test/claude/zealous-ride-1fn94u/vorbereiten.sh && bash vorbereiten.sh
 # nur bei "CHECK BESTANDEN":
-ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh apply'   # fragt JA ab
+ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh apply'   # JA eingeben
 ssh diretta-target 'sudo reboot'                          # ~2 Min, Strom nicht trennen
-ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh verify'  # erwartet VERIFY BESTANDEN, max_current 5000 mA
+ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh verify'  # VERIFY BESTANDEN, max_current 5000 mA
 ```
 
+Ohne `flashrom` (wahrscheinlich bei AudioLinux) wird das Update auf `/boot` abgelegt und beim Neustart vom Bootloader geschrieben; danach liegt `RECOVERY.000` auf `/boot` (harmlos).
 Rollback: `sudo bash ~/psu_eeprom.sh rollback /root/config-archiv/eeprom-<Zeit>-<PID>`.
-Bei `ABBRUCH` (besonders „kein Image passend"): komplette Ausgabe melden – es wurde nichts geändert.
 
 ## 6. Nächste Schritte
 
-1. `check` auf dem Target ausführen, Ausgabe auswerten.
+1. `vorbereiten.sh` auf dem Host ausführen (enthält `check`), Ausgabe auswerten.
 2. `apply` → Reboot → `verify`.
 3. iFi über passives Kabel anschließen.
 4. Messbatterie aus Abschnitt 3 wiederholen (Idle 300 s, 1-Kern, Burst, echte Wiedergabe).
