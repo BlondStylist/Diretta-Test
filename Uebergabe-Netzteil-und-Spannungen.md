@@ -64,16 +64,30 @@ ssh -t diretta-target 'sudo bash ~/psu_eeprom.sh verify'  # VERIFY BESTANDEN, ma
 Ohne `flashrom` (wahrscheinlich bei AudioLinux) wird das Update auf `/boot` abgelegt und beim Neustart vom Bootloader geschrieben; danach liegt `RECOVERY.000` auf `/boot` (harmlos).
 Rollback: `sudo bash ~/psu_eeprom.sh rollback /root/config-archiv/eeprom-<Zeit>-<PID>`.
 
-## 6. Nächste Schritte
+## 6. Ergebnisse 30.09.2026 (echte Hardware)
 
-1. `vorbereiten.sh` auf dem Host ausführen (enthält `check`), Ausgabe auswerten.
-2. `apply` → Reboot → `verify`.
-3. iFi über passives Kabel anschließen.
-4. Messbatterie aus Abschnitt 3 wiederholen (Idle 300 s, 1-Kern, Burst, echte Wiedergabe).
-5. Behalten nur bei: Idle-sd < 4 mV, Einbruch bei Wiedergabe > −50 mV, kein Überschwinger. Sonst iFi am Host testen oder zurückbauen.
-6. Modell des bisherigen Target-Netzteils erfragen.
+- iFi iPower Elite 5 V/5 A am Target, passives Barrel→USB-C-Kabel.
+- `vorbereiten.sh`: Target-Bootloader 2026-09-12 (1789171628), exaktes Image gefunden, `check` bestanden. Kein `flashrom` → Update über `/boot`.
+- `apply` → Reboot → `verify`: **BESTANDEN**, Bootloader-Version unverändert, device-tree `max_current` = **5000 mA**. Backup: `/root/config-archiv/eeprom-20260930_132830-4651`.
+- Schnellmessung mit `vcgencmd pmic_read_adc EXT5V_V` (300 Werte à 0,2 s, **vor** EEPROM-Änderung; grober als `ext5v`, kurze Einbrüche können fehlen):
 
-## 7. Geräteweise Detailoptimierung (Kandidaten, jeweils vorher/nachher messen)
+| | altes Netzteil (ext5v) | iFi Ruhe | iFi Wiedergabe |
+|---|---|---|---|
+| Mittel | 5,090–5,100 V | 5,012 V | 5,004 V |
+| sd | 4,3–5,1 mV | 4,7 mV | 7,6 mV |
+| Minimum rel. Ruhe-Mittel | −122 mV (Wiedergabe) | −18 mV | −38 mV |
+| `get_throttled` | – | 0x0 | 0x0 |
+
+- **Unterspannung beim Boot nach EEPROM-Flash:** `throttled=0x50000`, dmesg „Undervoltage detected" bei 5,94 s, „normalised" bei 7,99 s. **Normaler Reboot danach: `0x0`, kein Eintrag** → einmalig, vermutlich Flash-Boot. Beobachten: Kaltstart (Strom aus/an) noch nicht geprüft. iFi liefert 5,0 V (altes NT 5,1 V) → weniger Reserve; Kabellänge/-querschnitt ist der Hebel, falls es wiederkehrt.
+
+## 7. Nächste Schritte
+
+1. Nach dem nächsten **Kaltstart** `sudo vcgencmd get_throttled` prüfen (soll `0x0`).
+2. Messbatterie mit `~/ext5v/` wiederholen (Idle 300 s, 1-Kern, Burst, echte Wiedergabe), jetzt mit `PSU_MAX_CURRENT=5000`.
+3. Behalten bei: Idle-sd < 4 mV, Einbruch bei Wiedergabe > −50 mV, kein Überschwinger. Schnellmessung: Einbruch-Ziel erfüllt, Idle-sd (4,7 mV) noch nicht.
+4. Modell des bisherigen Target-Netzteils erfragen.
+
+## 8. Geräteweise Detailoptimierung (Kandidaten, jeweils vorher/nachher messen)
 
 **Beide Pi 5 (Host und Target):**
 - `vcgencmd get_throttled` (soll `0x0`), `vcgencmd pmic_read_adc` (EXT5V_V, Grundlage `ext5v`).
@@ -85,7 +99,7 @@ Rollback: `sudo bash ~/psu_eeprom.sh rollback /root/config-archiv/eeprom-<Zeit>-
 
 **Netzwerk:** Netzteile aller aktiven Geräte (Router/Switch/Medienkonverter) inventarisieren; nur Geräte im Diretta-Pfad priorisieren. Direktstrecke Host↔Target bleibt.
 
-## 8. Unsicher / unbestätigt
+## 9. Unsicher / unbestätigt
 
 - Skript nicht auf echter Hardware gelaufen; AudioLinux-Besonderheiten (Paket `rpi-eeprom`, `flashrom`, `strings`, `lspci`) unverifiziert – `check` prüft das zuerst.
 - DAC bus-power-unkritisch: Annahme.
