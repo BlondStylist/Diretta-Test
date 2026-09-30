@@ -38,3 +38,13 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 - Kette Target → DAC: Target USB-A → iFi Pulsar USB-C-Kabel → OptiLink (optisch getrennt) → iFi OMNI USB Switch → Topping HS-02 → Audiolab 8300CDQ (USB-B).
 - Host↔Target `end0`: absichtlich 10 Mbit/s, Wiedergabe nur 48/96 kHz.
 - Geplant: zweites iFi iPower Elite 5 V/5 A (Zuordnung Host oder OptiLink per Messung entscheiden).
+
+## Änderungsprotokoll (Konfiguration)
+
+| Datum | Gerät | Änderung | Rückgängig |
+|---|---|---|---|
+| 30.09.2026 | Target | EEPROM `PSU_MAX_CURRENT=5000` (psu_eeprom.sh v1.3, Backup `/root/config-archiv/eeprom-20260930_132830-4651`) | `sudo bash ~/psu_eeprom.sh rollback /root/config-archiv/eeprom-20260930_132830-4651` |
+| 30.09.2026 | Host | `/boot/config.txt`: `camera_auto_detect=1` → `0` (Sicherung `/boot/config.txt.vor-kamera`) | `sudo cp /boot/config.txt.vor-kamera /boot/config.txt` + Reboot |
+| 30.09.2026 | Host | `serial-getty@ttyAMA10.service` maskiert (serielle Anmeldung an GPIO aus) | `sudo systemctl unmask serial-getty@ttyAMA10.service && sudo systemctl start serial-getty@ttyAMA10.service` |
+| 30.09.2026 | Host | Bewusst **nicht** geändert: `display_auto_detect`, `avahi-daemon` (.local-Namen werden genutzt) | – |
+| 30.09.2026 | Netzteile | Tomanek nur noch Host; OptiLink an altes Target-NT (5,11 V) | umstecken |
