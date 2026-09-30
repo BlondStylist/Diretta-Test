@@ -53,6 +53,6 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 
 - ROCK 1.0 (Build 259), Roon Server 2.73 (Build 1694), alle Status OK. IP 192.168.178.26 per DHCP.
 - Datenträger: Datenbank auf internem M.2 (458 GB), Samsung SSD 860 1 TB (Musik, kaum genutzt). Quellen praktisch nur Qobuz und HRA, kein Roon-DSP.
-- Netzteil: Keces P8 (linear), 19 V. Laut Herstellerdaten je nach Ausführung 8 A (Einzelausgang 19/20 V) oder 4 A pro Ausgang (Doppelausgang 9/12 V + 18/19 V) → mindestens 76 W, NUC-Spitzenbedarf ca. 60–65 W (Original-NT 90 W): ausreichend. OLED-Anzeige zeigt Spannung und Strom.
+- Netzteil: Keces P8 **Doppelausgang** (9/12 V + 18/19 V, je 4 A, Überstromabschaltung 4,2 A, gemeinsamer Ringkerntrafo, getrennte Masse je Schiene). Schiene 19 V → NUC (max. ~80 W, NUC-Spitze ca. 60–65 W → Reserve, mit Turbo aus deutlich mehr); Schiene 12 V → FritzBox 7590 (Bedarf ca. 10–15 W, Original-NT 12 V/2,5 A). OLED-Anzeige zeigt Spannung und Strom.
 - Passives, lüfterloses Gehäuse. Angeschlossen nur LAN + DC.
 - BIOS noch nicht geändert. Geplant (Werte vorher notieren): WLAN, Bluetooth, HD Audio, Mikrofon, Card Reader, Consumer IR, ggf. Thunderbolt aus; Turbo Boost aus; LEDs aus; After Power Failure = Last State/Power On; C-States/SpeedStep/Hyper-Threading unverändert; CPU-Temperatur vorher/nachher ablesen.
