@@ -48,3 +48,11 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 | 30.09.2026 | Host | `serial-getty@ttyAMA10.service` maskiert (serielle Anmeldung an GPIO aus) | `sudo systemctl unmask serial-getty@ttyAMA10.service && sudo systemctl start serial-getty@ttyAMA10.service` |
 | 30.09.2026 | Host | Bewusst **nicht** geändert: `display_auto_detect`, `avahi-daemon` (.local-Namen werden genutzt) | – |
 | 30.09.2026 | Netzteile | Tomanek nur noch Host; OptiLink an altes Target-NT (5,11 V) | umstecken |
+
+## NUC8i7BEH (Roon ROCK) – Bestandsaufnahme 30.09.2026
+
+- ROCK 1.0 (Build 259), Roon Server 2.73 (Build 1694), alle Status OK. IP 192.168.178.26 per DHCP.
+- Datenträger: Datenbank auf internem M.2 (458 GB), Samsung SSD 860 1 TB (Musik, kaum genutzt). Quellen praktisch nur Qobuz und HRA, kein Roon-DSP.
+- Netzteil: Keces P8 (linear), 19 V. Laut Herstellerdaten je nach Ausführung 8 A (Einzelausgang 19/20 V) oder 4 A pro Ausgang (Doppelausgang 9/12 V + 18/19 V) → mindestens 76 W, NUC-Spitzenbedarf ca. 60–65 W (Original-NT 90 W): ausreichend. OLED-Anzeige zeigt Spannung und Strom.
+- Passives, lüfterloses Gehäuse. Angeschlossen nur LAN + DC.
+- BIOS noch nicht geändert. Geplant (Werte vorher notieren): WLAN, Bluetooth, HD Audio, Mikrofon, Card Reader, Consumer IR, ggf. Thunderbolt aus; Turbo Boost aus; LEDs aus; After Power Failure = Last State/Power On; C-States/SpeedStep/Hyper-Threading unverändert; CPU-Temperatur vorher/nachher ablesen.
