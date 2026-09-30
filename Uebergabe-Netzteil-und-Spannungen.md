@@ -80,11 +80,29 @@ Rollback: `sudo bash ~/psu_eeprom.sh rollback /root/config-archiv/eeprom-<Zeit>-
 
 - **Unterspannung beim Boot nach EEPROM-Flash:** `throttled=0x50000`, dmesg „Undervoltage detected" bei 5,94 s, „normalised" bei 7,99 s. **Normaler Reboot danach: `0x0`, kein Eintrag** → einmalig, vermutlich Flash-Boot. Beobachten: Kaltstart (Strom aus/an) noch nicht geprüft. iFi liefert 5,0 V (altes NT 5,1 V) → weniger Reserve; Kabellänge/-querschnitt ist der Hebel, falls es wiederkehrt.
 
+### ext5v-Messreihe 30.09.2026 (50 Hz, Logger auf Core 1, ohne künstliche Last, PSU_MAX_CURRENT=5000)
+
+Referenz altes Netzteil = Paar `p3-idle`/`p2-play` vom 28.09. (600 s); iFi = `ifi-idle`/`ifi-play` (300 s). Auswertung mit `ext5v_stats.py` v2.0, alle Qualitätsprüfungen PASS (`throttled=0x50000` = Boot-Merker, s. o.).
+
+| Größe | alt Ruhe | iFi Ruhe | alt Wiedergabe | iFi Wiedergabe |
+|---|---|---|---|---|
+| Mittel | 5,1019 V | 5,0194 V | 5,0830 V | 5,0086 V |
+| sd | 4,30 mV | **3,30 mV** | 7,93 mV | **6,54 mV** |
+| P99,9−P0,1 | 29,5 mV | **21,4 mV** | 52,3 mV | **42,9 mV** |
+| Spitze-Spitze | 46,9 mV | 36,2 mV | 155,4 mV | **67,0 mV** |
+| Mittel-Absenkung ggü. Ruhe | – | – | −18,9 mV | **−10,8 mV** |
+| P0,1 ggü. Ruhe-Mittel | – | – | −59,5 mV | **−45,3 mV** |
+| Minimum ggü. Ruhe-Mittel | – | – | −159,9 mV | **−66,7 mV** |
+| ADEV τ=1,28 s | 1,67 mV | 1,78 mV | 4,34 mV | **2,08 mV** |
+| ADEV τ=10 s | 2,18 mV | **0,78 mV** | 2,25 mV | 2,34 mV |
+
+**Bewertung:** iFi in allen audio-relevanten Größen besser: Ruhe-sd −23 % (Ziel < 4 mV erfüllt), Wiedergabe-sd −18 %, tiefster Einbruch bei Wiedergabe −60 %, langsame Eigenschwingung (τ 2,5–10 s) in Ruhe weitgehend verschwunden. Ziel „Einbruch ≤ −50 mV" für 99,9 % der Werte erfüllt (−45 mV), Einzelminimum −67 mV knapp darüber. Absolutspannung ~80 mV niedriger (iFi fest 5,0 V), mit > 300 mV Abstand zur Unterspannungsschwelle unkritisch. **Entscheidung: iFi am Target behalten.** Kabel (1,5 m + Barrel/USB-C-Adapter) fest verbaut, nicht tauschbar.
+
 ## 7. Nächste Schritte
 
-1. Nach dem nächsten **Kaltstart** `sudo vcgencmd get_throttled` prüfen (soll `0x0`).
-2. Messbatterie mit `~/ext5v/` wiederholen (Idle 300 s, 1-Kern, Burst, echte Wiedergabe), jetzt mit `PSU_MAX_CURRENT=5000`.
-3. Behalten bei: Idle-sd < 4 mV, Einbruch bei Wiedergabe > −50 mV, kein Überschwinger. Schnellmessung: Einbruch-Ziel erfüllt, Idle-sd (4,7 mV) noch nicht.
+1. Kaltstart geklärt: Unterspannung bei ~6 s nach jedem Kaltstart durch Einschaltstrom der USB-Kette (iFi OptiLink am USB-A); ohne USB-Kette `0x0`, Warmstart `0x0`. Nutzerentscheidung: so belassen (kein Einfluss auf Wiedergabe). Echte Betriebs-Einbrüche über `dmesg | grep -i undervoltage` erkennen (nur Einträge bei 6–8 s = Boot).
+2. Erledigt: ext5v-Messreihe mit iFi (siehe oben) → iFi behalten.
+3. Optional: 600-s-Läufe für exakte Laufzeit-Gleichheit mit der Referenz.
 4. Modell des bisherigen Target-Netzteils erfragen.
 
 ## 8. Geräteweise Detailoptimierung (Kandidaten, jeweils vorher/nachher messen)
