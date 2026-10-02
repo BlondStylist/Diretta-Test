@@ -23,9 +23,17 @@ Grundsaetze (verbindlich):
 Ergebnisse: `~/ext5v/results/...` mit `SHA256SUMS`, Kurzbericht `kurz.txt`. Alle Werte in `Messprotokoll.md` uebernehmen.
 
 Wichtige Grenzen der Spannungsmessung: ADC-Raster 1,34 mV, Absolutfehler ca. +-1,5 %, 50 Hz Abtastung
-(Ereignisse < 20 ms unsichtbar, Quellen nahe Vielfachen von 50 Hz fallen auf 0 Hz). Ob der PMIC-Sensor
-schnelle Lastwechsel ueberhaupt erfasst, zeigt die Kalibrierung `K7/K213` in `vschwank.py` - erst danach
-ein „keine Spitze" als „keine Stoerung" deuten.
+(Ereignisse < 20 ms unsichtbar, Quellen nahe Vielfachen von 50 Hz fallen auf 0 Hz).
+
+Kalibrierungen in `vschwank.py` (v1.2, geraetespezifisch, bei jeder Reihe neu):
+1. **Frequenzgang** `K3..K313` (+ `K213b` @47 Hz): identische Rechtecklast CPU0 bei 3,1-313 Hz -> Mittelungsfenster T des
+   PMIC-Sensors (Boxcar-Modell), H(f). Gemessene Linien-Amplituden werden mit 1/H(f) korrigiert (nur H >= 0,2, als Modell markiert).
+   Erst danach ein „keine Spitze" als „keine Stoerung" deuten.
+2. **Lastempfindlichkeit**: Hub je voll belastetem Kern aus der Grundwelle (Gegenprobe zur hostmess-Laststufe).
+3. **Drift-Klammerung** `I50 / I50m / I50b`: Mittelwerte relativ zur zeitlich interpolierten Ruhe; Spanne der Klammern <= 3 mV gefordert.
+4. **Netzbrumm** 50/100/150 Hz als Alias-Kandidaten bei 47 Hz (Linear-Netzteile).
+Fehlerangaben: Varianz > 0,1 Hz mit Segment-Standardfehler, Nachweisgrenze fuer Spitzen. Absolutwert nur mit externem
+Multimeter kalibrierbar (nicht automatisiert); fuer Relativvergleiche nicht noetig.
 
 ## 2. Latenz und Jitter (Kernel/Scheduler)
 

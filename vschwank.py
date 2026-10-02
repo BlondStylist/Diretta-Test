@@ -27,7 +27,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.1"
+VERSION = "1.2"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -40,6 +40,9 @@ WAIT_MAX = float(os.environ.get("VS_WAIT", "1800"))
 NSEG = 512                                                   # Welch-Segment (Potenz von 2)
 BANDS = ((0.09, 0.5), (0.5, 2.0), (2.0, 10.0), (10.0, 1e9))   # unterstes Band ab 1. Bin (0,098 Hz)
 KAL_LO, KAL_HI = 7.3, 213.0                                     # Kalibrierfrequenzen (Alias 213 Hz: 13 Hz @50, 22 Hz @47)
+KAL_F = (3.1, 7.3, 31.0, 113.0, 213.0, 313.0)                   # Frequenzgang-Stuetzstellen (alle Aliasse @50 Hz pruefbar)
+KAL_DUR = 120                                                   # Dauer je Kalibrierbedingung [s]
+SQ_FUND = 2 * math.sqrt(2) / math.pi / 2                        # rms der Grundwelle eines Rechtecks je Volt Hub (0,4502)
 VAR_FMIN = 0.09                                                 # Varianzanteile ohne Drift (< 0,1 Hz)
 log = H.log
 
@@ -151,6 +154,56 @@ def peak_rms(m, fa, win=0.15):
     nb = sorted(p[max(1, k - r):k - 2] + p[k + 3:k + r + 1]); bg = nb[len(nb) // 2] if nb else 0.0
     return math.sqrt(max(0.0, math.fsum(p[i] - bg for i in range(max(1, k - 2), min(len(p), k + 3))) * df))
 
+def sinc_h(f, T):
+    x = math.pi * f * T
+    return 1.0 if x == 0 else abs(math.sin(x) / x)
+
+def fit_window(pts):
+    """Mittelungsfenster T [s] eines Rechteck-(Boxcar-)Sensors aus (f, A)-Paaren; A = A0*|sinc(f T)|.
+    Gitter 0..40 ms in 0,05 ms, A0 je T analytisch (kleinste Quadrate). -> (T, A0, rel. Restfehler)"""
+    best = None
+    for i in range(801):
+        T = i * 5e-5
+        hs = [sinc_h(f, T) for f, _ in pts]
+        den = math.fsum(h * h for h in hs)
+        if den <= 0:
+            continue
+        a0 = math.fsum(h * a for h, (_, a) in zip(hs, pts)) / den
+        res = math.fsum((a - a0 * h) ** 2 for h, (_, a) in zip(hs, pts))
+        if best is None or res < best[2]:
+            best = (T, a0, res)
+    if not best or best[1] <= 0:
+        return None
+    return best[0], best[1], math.sqrt(best[2] / len(pts)) / best[1]
+
+def kal_fit(M):
+    """Kalibrierpunkte (Tag, f, Alias, rms, xRuhe, signifikant) und Fensterfit."""
+    krow, kpts = [], []
+    for fk in KAL_F:
+        t = ktag(fk)
+        if t in M and "f" in M[t]:
+            fa = alias(fk, M[t]["fs"]); a = peak_rms(M[t], fa)
+            rr, _ = excess(M[t], M.get("I50"), fa, 0.15)
+            ok = rr >= 4 and math.isfinite(a)
+            krow.append((t, fk, fa, a, rr, ok))
+            if ok:
+                kpts.append((fk, a))
+    return krow, (fit_window(kpts) if len(kpts) >= 3 else None)
+
+def baseline(M, C, t_mid):
+    """Ruhe-Mittel zur Zeit t_mid, linear zwischen den Drift-Klammern I50/I50m/I50b (ausserhalb: naechster Wert)."""
+    pts = sorted(((C[t]["c0"]["t"] + C[t]["c1"]["t"]) / 2, M[t]["mean"]) for t in IDLE_REF if t in M and "mean" in M[t])
+    if not pts:
+        return float("nan"), "keine Ruhe-Referenz"
+    if t_mid <= pts[0][0]:
+        return pts[0][1], "vor erster Referenz (nicht interpoliert)"
+    if t_mid >= pts[-1][0]:
+        return pts[-1][1], "nach letzter Referenz (nicht interpoliert)"
+    for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+        if ta <= t_mid <= tb:
+            return va + (vb - va) * (t_mid - ta) / (tb - ta), "interpoliert"
+    return pts[-1][1], "?"
+
 def alias(fsrc, fs):
     return abs(fsrc - round(fsrc / fs) * fs)
 
@@ -261,8 +314,8 @@ def net_rates(a, b):
 
 # ------------------------------------------------------------------ Versuchsreihe
 class Series:
-    def __init__(self, cdir, dur, with_music):
-        self.dir, self.dur, self.music = cdir, dur, with_music
+    def __init__(self, cdir, dur, with_music, kal_kurz=False):
+        self.dir, self.dur, self.music, self.kal_kurz = cdir, dur, with_music, kal_kurz
         self.raw = os.path.join(cdir, "raw"); os.makedirs(self.raw, exist_ok=True)
         self.children, self.gen, self.params, self.state = [], None, {}, None
 
@@ -288,15 +341,16 @@ class Series:
                 raise SystemExit("Zeitueberschreitung beim Warten auf: " + txt)
             time.sleep(1.0)
 
-    def condition(self, tag, hz, want_play, gen=None):
+    def condition(self, tag, hz, want_play, gen=None, dur=None):
         only = os.environ.get("VS_ONLY")              # nur fuer Tests: Teilmenge der Bedingungen
         if only and tag not in only.split(","):
             return None
-        log("== %s: %s, %d Hz, %d s%s" % (tag, "Wiedergabe" if want_play else "Ruhe", hz, self.dur,
+        dur = dur or self.dur
+        log("== %s: %s, %d Hz, %d s%s" % (tag, "Wiedergabe" if want_play else "Ruhe", hz, dur,
                                          (", Last: " + gen[0]) if gen else ""))
         self.wait_state(want_play)
         cd = os.path.join(self.dir, tag); os.makedirs(cd, exist_ok=True)
-        info = {"tag": tag, "hz": hz, "dur": self.dur, "want_play": want_play, "alsa_start": H.alsa_state()[1]}
+        info = {"tag": tag, "hz": hz, "dur": dur, "want_play": want_play, "alsa_start": H.alsa_state()[1]}
         if gen:
             self.gen = SquareGen(gen[1], gen[0]) if gen[2] == "rechteck" else Pacer(gen[1], gen[2], gen[0])
             self.gen.start()
@@ -306,7 +360,7 @@ class Series:
         outp = os.path.join(cd, "run_out.txt")
         env = dict(os.environ, EXT5V_CPU=H.LOGGER_CPU, EXT5V_OUT=self.raw)
         with open(outp, "w") as of:
-            p = subprocess.Popen([os.path.join(H.EXT5V, "ext5v_run.sh"), str(hz), str(self.dur), "vs-" + tag], env=env,
+            p = subprocess.Popen([os.path.join(H.EXT5V, "ext5v_run.sh"), str(hz), str(dur), "vs-" + tag], env=env,
                                  stdin=subprocess.DEVNULL, stdout=of, stderr=subprocess.STDOUT, start_new_session=True)
         self.children.append(p)
         lpid, lstart = H.find_logger_start(p.pid)
@@ -314,7 +368,7 @@ class Series:
         if lstart is None:
             log("FEHLER ext5v_log-Start nicht erkannt")
         try:
-            p.wait(timeout=self.dur + 120)
+            p.wait(timeout=dur + 120)
         except subprocess.TimeoutExpired:
             info["timeout"] = True; H.kill_group(p)
         self.children.remove(p)
@@ -368,10 +422,11 @@ class Series:
         self.condition("E47", 47, False, ("end0-Verkehr", p["end0_hz"], udp_sender(END0_DST, p["end0_payload"])))
         self.condition("U50", 50, False, (LAN + "-Verkehr", p["lan_hz"], udp_sender(LAN_DST, p["lan_payload"])))
         self.condition("C50", 50, False, ("CPU0-Wecker 50us", p["cpu_hz"], cpu_burst(50)))
-        # Kalibrierung der Messkette: gleiche Rechtecklast langsam (7,3 Hz) und schnell (213 Hz)
-        self.condition("K7", 50, False, ("Rechteck CPU0 %.1f Hz" % KAL_LO, KAL_LO, "rechteck"))
-        self.condition("K213", 50, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"))
-        self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"))
+        self.condition("I50m", 50, False)                       # Drift-Klammer Mitte
+        # Kalibrierung der Messkette: Frequenzgang mit identischer Rechtecklast
+        for fk in (KAL_F if not self.kal_kurz else (KAL_LO, KAL_HI)):
+            self.condition(ktag(fk), 50, False, ("Rechteck CPU0 %g Hz" % fk, fk, "rechteck"), dur=min(self.dur, KAL_DUR))
+        self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"), dur=min(self.dur, KAL_DUR))
         self.condition("I50b", 50, False)
 
     def cleanup(self):
@@ -382,7 +437,7 @@ class Series:
             H.kill_group(p)
 
 
-def child_main(cdir, dur, music, lockfd):
+def child_main(cdir, dur, music, lockfd, kal_kurz=False):
     lock = os.fdopen(lockfd, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -392,7 +447,7 @@ def child_main(cdir, dur, music, lockfd):
         os.sched_setaffinity(0, {H.CTL_CPU})
     except OSError as e:
         log("WARN  CPU-Bindung nicht moeglich: %s" % e)
-    s = Series(cdir, dur, music)
+    s = Series(cdir, dur, music, kal_kurz)
     def on_term(*_):
         raise SystemExit("durch stop beendet")
     signal.signal(signal.SIGTERM, on_term)
@@ -400,7 +455,7 @@ def child_main(cdir, dur, music, lockfd):
     try:
         pre = preflight()
         H.wjson(os.path.join(cdir, "series.json"), {"version": VERSION, "hostmess": H.VERSION, "dur": dur,
-                "music": music, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
+                "music": music, "kal_kurz": kal_kurz, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
                 "kernel": os.uname().release, "pid": os.getpid(), "pre": pre,
                 "env": {k: v for k, v in os.environ.items() if k.startswith(("VS_", "HOSTMESS_"))},
                 "diretta_setting": H.rd("/opt/diretta-alsa/setting.inf", None), "test_mode": H.TEST})
@@ -483,7 +538,16 @@ def preflight():
 
 
 # ------------------------------------------------------------------ Auswertung
-TAGS = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "K7", "K213", "K213b", "I50b"]
+def ktag(f):
+    return "K%d" % int(f)        # 3,1 -> K3, 7,3 -> K7, 31 -> K31, 213 -> K213
+
+KTAGS = [ktag(f) for f in KAL_F]
+TAGS = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "I50m"] + KTAGS + ["K213b", "I50b"]
+IDLE_REF = ("I50", "I50m", "I50b")
+
+def temp_of(c):
+    t = [r["temp"] for r in c.get("rows", []) if math.isfinite(r.get("temp", float("nan")))]
+    return sum(t) / len(t) if t else float("nan")
 
 def load_cond(cdir, tag):
     """Bedingung laden; None wenn nicht vorhanden. Defekte Dateien -> {'defekt': Grund}."""
@@ -504,7 +568,7 @@ def load_cond(cdir, tag):
     info.update({"v": v, "fs": fs, "dt_max": max(dts) if dts else float("nan"),
                  "dt_gaps": sum(1 for d in dts if d > 1.5 / info["hz"]),
                  "alsa_frac": 100.0 * sum(al) / len(al) if al else float("nan"),
-                 "rates": sorted({r["rate"] for r in smp if r.get("rate")})})
+                 "rates": sorted({r["rate"] for r in smp if r.get("rate")}), "rows": smp})
     return info
 
 def metrics(c):
@@ -623,7 +687,8 @@ def analyse(cdir):
     params = H.rjson(pp) if os.path.isfile(pp) else {}
     lan = params.get("lan_if", LAN)
     C, M = {}, {}
-    soll = TAGS if meta.get("music") else TAGS[2:]
+    soll = [t for t in (TAGS if meta.get("music") else TAGS[2:])
+            if not (meta.get("kal_kurz") and t in KTAGS and t not in (ktag(KAL_LO), ktag(KAL_HI)))]
     for t in soll:
         c = load_cond(cdir, t)
         if c is None:
@@ -669,6 +734,7 @@ def analyse(cdir):
         fz = params["end0_hz"]
         cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
                  ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
+    cands += [("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47"))]
     for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
         if t in C and C[t].get("gen"):
             cands.append(("%s erzeugt" % t, C[t]["gen"]["ist_hz"], (t,)))
@@ -681,16 +747,27 @@ def analyse(cdir):
             fa = alias(fsrc, m["fs"])
             if not testable(fa, m):
                 res.append("%s %.2f Hz n.p." % (t, fa)); continue
-            rr, loc = excess(m, M.get("I47" if t.endswith("47") else "I50"), fa)
+            ref_t = "I47" if t.endswith("47") else "I50"
+            if t == ref_t:      # Ruhe gegen sich selbst nicht vergleichbar: nur Umgebung
+                _, loc = excess(m, m, fa)
+                res.append("%s %.2f Hz -/%s%s" % (t, fa, fmt(loc, 0), " SPITZE(Umgebung)" if loc >= 10 else ""))
+                continue
+            rr, loc = excess(m, M.get(ref_t), fa)
             res.append("%s %.2f Hz %s/%s%s" % (t, fa, fmt(rr, 0), fmt(loc, 0), " SPITZE" if rr >= 4 and loc >= 10 else ""))
         line = "  %-15s %7.2f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
         L.append(line); S.append(line)
     if params:
         for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
             ivs = source_search(M, f0)
+            fit_ = kal_fit(M)[1]
+            def corr(fq, rms):
+                if not fit_:
+                    return ""
+                hq = sinc_h(fq, fit_[0])
+                return ", korrigiert %s mV (H=%.2f, Modell)" % (fmt(rms / hq), hq) if hq >= 0.2 else ", H=%.2f zu klein fuer Korrektur" % hq
             line = "  Quellsuche %s +-25 Hz (Spitze in P47 und P50, oder P50 blind): %s" % (name, "; ".join(
-                "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
-                ", P50 blind" if math.isnan(h[3]) else "") for a, b, h in ivs) or "kein Treffer")
+                "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
+                ", P50 blind" if math.isnan(h[3]) else "", corr(h[0], h[4])) for a, b, h in ivs) or "kein Treffer")
             L.append(line); S.append(line)
     # Varianzanteile (ohne Drift < 0,1 Hz)
     if all(t in M and "var_hf" in M[t] for t in ("I50", "P50")):
@@ -709,28 +786,55 @@ def analyse(cdir):
                 line = "  %-21s %6.2f +- %4.2f mV^2 = %5.0f +- %3.0f %% der Wiedergabe-Zusatzvarianz%s" % (
                     lab, ex, uex, 100 * ex / (vp - vi), 100 * uex / (vp - vi), "  (E50 - C50)" if minus else "")
                 L.append(line); S.append(line)
-    if "K7" in M and "f" in M["K7"]:
+    # Kalibrierung 1: Frequenzgang der Messkette (identische Rechtecklast, verschiedene Frequenzen)
+    krow, fit = kal_fit(M)
+    if krow:
         L.append(""); S.append("")
-        k7 = M["K7"]; r7, _ = excess(k7, M.get("I50"), KAL_LO, 0.15)
-        a7 = peak_rms(k7, KAL_LO)
-        dm = k7["mean"] - M["I50"]["mean"] if "I50" in M and "mean" in M["I50"] else float("nan")
-        line = "Kalibrierung Messkette (Rechtecklast CPU0): %.1f Hz -> rms %s mV (x%s ggue. Ruhe), Mittel %+.2f mV" % (
-            KAL_LO, fmt(a7), fmt(r7, 0), dm)
-        L.append(line); S.append(line)
-        for t in ("K213", "K213b"):
-            if t in M and "f" in M[t]:
-                fa = alias(KAL_HI, M[t]["fs"]); ah = peak_rms(M[t], fa)
-                rr, _ = excess(M[t], M.get("I47" if t == "K213b" else "I50"), fa, 0.15)
-                line = "  %.0f Hz @%.2f Hz -> Alias %.2f Hz rms %s mV (x%s) = %s %% der 7,3-Hz-Amplitude" % (
-                    KAL_HI, M[t]["fs"], fa, fmt(ah), fmt(rr, 0), fmt(100 * ah / a7 if a7 > 0 else float("nan"), 0))
-                L.append(line); S.append(line)
-        line = ("  Deutung: ~100 % = Sensor tastet momentan ab (500-Hz-Effekte sichtbar); ~0 % = Sensor mittelt,"
-                " schnelle Lastwechsel sind fuer diese Messung grundsaetzlich unsichtbar.")
-        L.append(line); S.append(line)
-        if "P50" in M and "det_rms" in M["P50"]:
-            line = "  Nachweisgrenze Spitze (2-20 Hz): P50 %s mV rms, I50 %s mV rms" % (fmt(M["P50"]["det_rms"]), fmt(M["I50"].get("det_rms")))
+        hd = "Kalibrierung 1 - Frequenzgang Messkette (Rechtecklast CPU0, Grundwellen-rms am Alias):"
+        L.append(hd); S.append(hd)
+        a_ref = fit[1] if fit else (krow[0][3] if krow else float("nan"))
+        for t, fk, fa, a, rr, ok in krow:
+            line = "  %-5s %6.1f Hz -> Alias %5.2f Hz  rms %s mV  x%s ggue. Ruhe  H=%s%s" % (
+                t, fk, fa, fmt(a), fmt(rr, 0), fmt(a / a_ref if a_ref > 0 else float("nan")),
+                "" if ok else "  (nicht signifikant, nicht im Fit)")
             L.append(line); S.append(line)
+        if "K213b" in M and "f" in M["K213b"]:
+            fa = alias(KAL_HI, M["K213b"]["fs"]); a = peak_rms(M["K213b"], fa)
+            line = "  K213b %6.1f Hz @47 Hz -> Alias %5.2f Hz rms %s mV  H=%s (Gegenprobe zu K213)" % (
+                KAL_HI, fa, fmt(a), fmt(a / a_ref if a_ref > 0 else float("nan")))
+            L.append(line); S.append(line)
+        if fit:
+            T, a0, rel = fit
+            line = "  Modell Mittelungsfenster T = %.2f ms (Restfehler %.0f %%)%s; H(500 Hz) = %.2f, H(1000 Hz) = %.2f (Modell, oberhalb 313 Hz extrapoliert)" % (
+                1000 * T, 100 * rel, " - MODELL PASST SCHLECHT" if rel > 0.15 else "", sinc_h(500, T), sinc_h(1000, T))
+            L.append(line); S.append(line)
+            checks.append(("Kalibrierung: Frequenzgang-Modell passt (Restfehler %.0f %% <= 15 %%)" % (100 * rel), rel <= 0.15))
+            # Kalibrierung 2: Lastempfindlichkeit aus der Grundwelle (Rechteck-Hub = Absenkung je Kern)
+            hub = a0 / SQ_FUND
+            line = "  Kalibrierung 2 - Lastempfindlichkeit: Hub %.1f mV je voll belastetem Kern (Gegenprobe hostmess-Laststufe 25,2 mV)" % hub
+            L.append(line); S.append(line)
+        else:
+            line = "  Frequenzgang-Modell nicht bestimmbar (< 3 signifikante Stuetzstellen)"
+            L.append(line); S.append(line)
+        for t in ("P50", "I50"):
+            if t in M and "det_rms" in M[t]:
+                line = "  Nachweisgrenze Spitze 2-20 Hz %s: %s mV rms" % (t, fmt(M[t]["det_rms"]))
+                L.append(line); S.append(line)
+    # Kalibrierung 3: Drift-Klammerung (Ruhe am Anfang/Mitte/Ende)
+    if sum(1 for t in IDLE_REF if t in M and "mean" in M[t]) >= 2:
+        L.append(""); S.append("")
+        hd = "Kalibrierung 3 - Drift: Ruhe-Referenzen " + ", ".join("%s %.3f mV (%s C)" % (t, M[t]["mean"], fmt(temp_of(C[t]), 1))
+                                                                   for t in IDLE_REF if t in M and "mean" in M[t])
+        L.append(hd); S.append(hd)
+        line = "  Mittel relativ zur driftkorrigierten Ruhe [mV]: " + "; ".join(
+            "%s %+.2f%s" % (t, M[t]["mean"] - b, "" if how == "interpoliert" else "*")
+            for t in TAGS if t in M and "mean" in M[t] and t not in IDLE_REF
+            for b, how in [baseline(M, C, (C[t]["c0"]["t"] + C[t]["c1"]["t"]) / 2)]) + "  (* = nicht interpoliert)"
+        L.append(line); S.append(line)
     if all(t in M and "mean" in M[t] for t in ("I50", "I50b")):
+        if "I50m" in M and "mean" in M["I50m"]:
+            mm = [M[t]["mean"] for t in IDLE_REF]
+            checks.append(("Ruhe-Referenzen konsistent (Spanne %.2f mV <= 3 mV)" % (max(mm) - min(mm)), max(mm) - min(mm) <= 3.0))
         dmean = M["I50b"]["mean"] - M["I50"]["mean"]
         rv = M["I50b"]["var_hf"] / M["I50"]["var_hf"] if M["I50"]["var_hf"] > 0 else float("nan")
         checks.append(("Ruhe stabil: I50b-I50 Mittel %+.2f mV, Varianz x%.2f" % (dmean, rv), abs(dmean) <= 3.0 and 0.75 <= rv <= 1.33))
@@ -817,6 +921,16 @@ def selftest():
     chk(not testable(alias(500.0, 50.0), MM["P50"]) and testable(alias(505.1, 49.996), MM["P50"]), "Pruefbarkeit (0 Hz = n.p.)")
     a = adev([float(i % 2) for i in range(1000)], 50.0)
     chk(abs(a[0.04] - 0.0) < 1e-12, "ADEV (Periode 2 bei tau=2 Samples = 0)")
+    for Tt in (0.0, 0.004, 0.010):
+        fw = fit_window([(f, 4.5 * sinc_h(f, Tt) * (1 + random.gauss(0, 0.02))) for f in KAL_F])
+        chk(fw and abs(fw[0] - Tt) < 0.0006 and abs(fw[1] - 4.5) < 0.2,
+            "Fensterfit T=%.0f ms -> %.2f ms, A0 %.2f" % (1000 * Tt, 1000 * fw[0], fw[1]) if fw else "Fensterfit fehlgeschlagen")
+    Mb = {"I50": {"mean": 10.0}, "I50m": {"mean": 12.0}, "I50b": {"mean": 14.0}}
+    Cb = {"I50": {"c0": {"t": 0}, "c1": {"t": 10}}, "I50m": {"c0": {"t": 100}, "c1": {"t": 110}},
+          "I50b": {"c0": {"t": 200}, "c1": {"t": 210}}}
+    bl = baseline(Mb, Cb, 155.0)
+    chk(abs(bl[0] - 13.0) < 1e-9 and bl[1] == "interpoliert" and baseline(Mb, Cb, 0.0)[1].startswith("vor"),
+        "Drift-Basislinie linear interpoliert (13,0 bei t=155)")
     sg = SquareGen(5.0, "t"); sg.start(); time.sleep(1.0)
     states = set()
     for _ in range(20):
@@ -837,11 +951,12 @@ def main():
     ap = argparse.ArgumentParser(prog="vschwank.py")
     sp = ap.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("run"); r.add_argument("--dur", type=int, default=180); r.add_argument("--ohne-musik", action="store_true")
+    r.add_argument("--kal-kurz", action="store_true", help="nur 2 Kalibrierfrequenzen (7,3 / 213 Hz) statt 6")
     sp.add_parser("status"); sp.add_parser("stop"); sp.add_parser("selftest")
     a = sp.add_parser("analyse"); a.add_argument("ordner")
     v = sp.add_parser("vergleich"); v.add_argument("a"); v.add_argument("b")
     k = sp.add_parser("_child"); k.add_argument("dir"); k.add_argument("dur", type=int); k.add_argument("music", type=int)
-    k.add_argument("lockfd", type=int)
+    k.add_argument("lockfd", type=int); k.add_argument("kal_kurz", type=int)
     args = ap.parse_args()
     if args.cmd == "selftest":
         return selftest()
@@ -850,7 +965,7 @@ def main():
     if args.cmd == "vergleich":
         print(compare(os.path.abspath(args.a), os.path.abspath(args.b)), end=""); return 0
     if args.cmd == "_child":
-        return child_main(args.dir, args.dur, bool(args.music), args.lockfd)
+        return child_main(args.dir, args.dur, bool(args.music), args.lockfd, bool(args.kal_kurz))
     curp = os.path.join(SHM, "current.json")
     cur = H.rjson(curp) if os.path.isfile(curp) else None
     if args.cmd == "status":
@@ -878,13 +993,15 @@ def main():
     logp = os.path.join(cdir, "run.log")
     with open(logp, "w") as lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_child", cdir, str(args.dur),
-                              str(0 if args.ohne_musik else 1), str(lock.fileno())], stdin=subprocess.DEVNULL,
+                              str(0 if args.ohne_musik else 1), str(lock.fileno()), str(int(args.kal_kurz))], stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
     lock.close()
     H.wjson(curp, {"dir": cdir, "pid": p.pid})
-    n = 10 + (0 if args.ohne_musik else 2)
-    print("Versuchsreihe gestartet: %d Bedingungen x %d s, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
-        n, args.dur, round((n * (args.dur + 25) + 60) / 60)))
+    nk = 3 if args.kal_kurz else 7
+    n = 8 + (0 if args.ohne_musik else 2)
+    tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE
+    print("Versuchsreihe gestartet: %d Bedingungen + %d Kalibrierungen, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
+        n, nk, round(tot / 60)))
     print("Fortschritt:  python3 vschwank.py status      Abbruch:  python3 vschwank.py stop\n")
     pos = 0
     try:
