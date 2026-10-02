@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""vschwank.py v1.0 - Ursachenanalyse der Spannungsschwankung bei Wiedergabe (Diretta-Host, Raspberry Pi 5).
+"""vschwank.py v1.3 - Ursachenanalyse der Spannungsschwankung bei Wiedergabe (Diretta-Host, Raspberry Pi 5).
 
 Benoetigt hostmess.py im selben Verzeichnis (gemeinsame, getestete Mess-Bausteine). Nur Standardbibliothek,
 kein sudo, aendert keine Konfiguration.
 
   python3 vschwank.py run [--dur S] [--ohne-musik]   Versuchsreihe starten (laeuft abgekoppelt weiter)
+  python3 vschwank.py widerstand [--dur S]          nur Zuleitungswiderstand messen (auch am Target, Musik egal)
   python3 vschwank.py status | stop
   python3 vschwank.py analyse ORDNER                 Bericht neu erzeugen (schreibt nichts)
   python3 vschwank.py vergleich ORDNER_A ORDNER_B    Vorher/Nachher-Vergleich zweier Reihen
@@ -15,11 +16,14 @@ Versuchsplan (je Bedingung DUR s, Standard 180 s):
   Musik aus: I50 Ruhe @50 | I47 Ruhe @47 | E50/E47 nachgebildeter Diretta-Verkehr auf end0 (Rate/Groesse aus P50)
              U50 nachgebildeter Verkehr ueber den USB-Netzwerkadapter (enu1, Rate/Groesse aus P50)
              C50 CPU-Weckrhythmus wie Diretta (Rate aus P50) auf CPU0
+             C47/C47x CPU-Weckrhythmus @47 Hz: Rechenzeit je Zyklus wie Diretta (gemessen P50-I50) bzw. ~10 % Tastverh.
+                      (Positivkontrolle) -> Anteil Prozessor an der 500-Hz-Linie
+             R50      Laststufe 10 s an / 10 s aus + PMIC-Strommessung -> Widerstand Netzteil+Kabel+Stecker
              K7/K213/K213b Kalibrierung der Messkette (Rechtecklast CPU0 7,3 Hz und 213 Hz @50/@47)
              I50b Ruhe-Wiederholung (Stabilitaet)
 Auswertung: Statistik, Spektrum (Welch), Allan-Abweichung, Alias-Vorhersage, Varianzanteile, Aktivitaet.
 """
-import argparse, cmath, fcntl, glob, hashlib, math, os, shutil, signal, socket, subprocess, sys, threading, time, traceback
+import argparse, cmath, fcntl, glob, hashlib, math, os, re, shutil, signal, socket, subprocess, sys, threading, time, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -27,7 +31,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.2"
+VERSION = "1.3"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -44,6 +48,11 @@ KAL_F = (3.1, 7.3, 31.0, 113.0, 213.0, 313.0)                   # Frequenzgang-S
 KAL_DUR = 120                                                   # Dauer je Kalibrierbedingung [s]
 SQ_FUND = 2 * math.sqrt(2) / math.pi / 2                        # rms der Grundwelle eines Rechtecks je Volt Hub (0,4502)
 VAR_FMIN = 0.09                                                 # Varianzanteile ohne Drift (< 0,1 Hz)
+R_FREQ = 0.05                                                   # Laststufe R50: 10 s an / 10 s aus
+R_SKIP = 2.0                                                    # je Halbperiode verworfen (Einschwingen) [s]
+PMIC_DT = 0.5                                                   # PMIC-Abfrage R50 [s]
+ETA = (0.80, 0.875, 0.95)                                       # Wirkungsgrad PMIC-Wandler (Annahme, Spanne)
+MECH_DUTY = 0.10                                                # C47x: Tastverhaeltnis der Positivkontrolle
 log = H.log
 
 
@@ -237,9 +246,13 @@ class Pacer(threading.Thread):
         self.stop_ev = threading.Event(); self.n = 0; self.err = 0; self.late = []; self.t0 = self.t1 = None
 
     def run(self):
-        per = 1.0 / self.rate; nxt = time.monotonic(); self.t0 = H.now_boot()
+        per = 1.0 / self.rate; nxt = time.monotonic(); self.t0 = H.now_boot(); c0 = time.thread_time()
         while not self.stop_ev.is_set():
             d = nxt - time.monotonic()
+            if d > 0.05:                      # lange Wartezeit: abbrechbar
+                if self.stop_ev.wait(d - 0.02):
+                    break
+                d = nxt - time.monotonic()
             if d > 0:
                 time.sleep(d)
             self.late.append(time.monotonic() - nxt)
@@ -251,12 +264,14 @@ class Pacer(threading.Thread):
             nxt += per
             if time.monotonic() - nxt > 3 * per:  # mehr als 3 Perioden zurueck: Takt neu aufsetzen, nicht buendeln
                 nxt = time.monotonic(); self.resync = getattr(self, "resync", 0) + 1
-        self.t1 = H.now_boot()
+        self.t1 = H.now_boot(); self.cpu_s = time.thread_time() - c0   # Rechenzeit dieses Threads (Nutzer + Kern)
 
     def stats(self):
         dt = (self.t1 or H.now_boot()) - (self.t0 or H.now_boot())
         s = sorted(self.late)
-        return {"label": self.label, "soll_hz": self.rate, "ist_hz": self.n / dt if dt > 0 else 0.0, "n": self.n,
+        cpu = getattr(self, "cpu_s", float("nan"))
+        return {"label": self.label, "soll_hz": self.rate, "ist_hz": self.n / dt if dt > 0 else 0.0, "n": self.n, "dauer_s": dt,
+                "cpu_us_je_aufruf": 1e6 * cpu / self.n if self.n else float("nan"),
                 "fehler": self.err, "verzug_p50_ms": 1000 * pct(s, 50), "verzug_p99_ms": 1000 * pct(s, 99),
                 "verzug_max_ms": 1000 * (s[-1] if s else float("nan")), "neu_aufgesetzt": getattr(self, "resync", 0),
                 "anteil_ueber_1ms": 100.0 * sum(1 for x in s if x > 1e-3) / len(s) if s else float("nan")}
@@ -266,9 +281,11 @@ class SquareGen(threading.Thread):
     def __init__(self, freq, label):
         super().__init__(daemon=True)
         self.freq, self.label, self.stop_ev, self.pacer, self.proc, self.on = freq, label, threading.Event(), None, None, True
+        self.toggles = []
 
     def _toggle(self):
         os.kill(self.proc.pid, signal.SIGSTOP if self.on else signal.SIGCONT); self.on = not self.on
+        self.toggles.append((H.now_boot(), self.on))      # (Zeit, Last an?) fuer R50
 
     def _cpu(self):
         st = H.parse_task_stat(H.rd("/proc/%d/stat" % self.proc.pid))
@@ -295,6 +312,7 @@ class SquareGen(threading.Thread):
                                                     "verzug_max_ms": float("nan")}
         st["rechteck_hz"] = self.freq
         st["tastverhaeltnis"] = getattr(self, "duty", float("nan"))
+        st["toggles"] = list(self.toggles)
         return st
 
 def udp_sender(dst, size):
@@ -309,12 +327,94 @@ def cpu_burst(us=50):
             pass
     return f
 
+def tune_burst(target_us, rate, rounds=3, probe=1.0):
+    """Wartezeit der Schleife so waehlen, dass die GEMESSENE Rechenzeit je Aufruf (inkl. Python/Kern-Aufwand) target_us
+    trifft. -> (busy_us, gemessen_us); gemessen > Soll, wenn schon der Mindestaufwand groesser ist."""
+    busy, got = 0.0, float("nan")
+    for _ in range(rounds):
+        pc = Pacer(rate, cpu_burst(busy), "abgleich"); pc.start(); time.sleep(probe); pc.stop_ev.set(); pc.join(5)
+        got = pc.stats()["cpu_us_je_aufruf"]
+        if not math.isfinite(got):
+            break
+        busy = max(0.0, busy + (target_us - got))
+    return busy, got
+
+
+# ------------------------------------------------------------------ PMIC (R50)
+PMIC_RE = re.compile(r"^\s*(\S+)_([AV])\s+\w+\(\d+\)=([-+0-9.eE]+)[AV]\s*$")
+
+def parse_pmic(txt):
+    """vcgencmd pmic_read_adc -> (Summe V*I der Schienen [W], EXT5V [V], {Schiene: W})"""
+    a, v = {}, {}
+    for ln in txt.splitlines():
+        m = PMIC_RE.match(ln)
+        if m:
+            (a if m.group(2) == "A" else v)[m.group(1)] = float(m.group(3))
+    rails = {k: a[k] * v[k] for k in a if k in v}
+    return (math.fsum(rails.values()) if rails else float("nan")), v.get("EXT5V", float("nan")), rails
+
+class PmicSampler(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop_ev, self.rows, self.err = threading.Event(), [], 0
+
+    def run(self):
+        nxt = time.monotonic()
+        while not self.stop_ev.is_set():
+            ta = H.now_boot(); out = H.sh(["vcgencmd", "pmic_read_adc"], timeout=5); tb = H.now_boot()
+            p, u, rails = parse_pmic(out)
+            if math.isfinite(p):
+                self.rows.append({"t": (ta + tb) / 2, "dauer": tb - ta, "p": p, "ext5v": u,
+                                  "core": rails.get("VDD_CORE", float("nan"))})
+            else:
+                self.err += 1
+            nxt += PMIC_DT
+            self.stop_ev.wait(max(0.0, nxt - time.monotonic()))
+
+
+# ------------------------------------------------------------------ Diretta-Rechenzeit
+def diretta_rt():
+    """Summe Laufzeit [ns] aller Diretta-Threads + end0-IRQ-Threads + ksoftirqd (schedstat, sonst stat-Ticks)."""
+    irqs = set()
+    for ln in H.rd("/proc/interrupts").splitlines():
+        n = ln.split(":", 1)[0].strip()
+        if n.isdigit() and re.search(r"\b(%s|eth\d*)\b" % re.escape(END0), ln):
+            irqs.add(n)
+    tot, src, names = 0, set(), set()
+    for pdir in glob.glob("/proc/[0-9]*"):
+        cmd = H.rd(pdir + "/cmdline").replace("\0", " ").lower(); comm = H.rd(pdir + "/comm").strip().lower()
+        isd = "diretta" in cmd or "diretta" in comm or "syncalsa" in comm
+        for tdir in glob.glob(pdir + "/task/[0-9]*"):
+            tc = H.rd(tdir + "/comm").strip()
+            m = re.match(r"irq/(\d+)-", tc)
+            if not (isd or (m and m.group(1) in irqs) or tc.startswith("ksoftirqd/")):
+                continue
+            ss = H.rd(tdir + "/schedstat").split()
+            if ss and ss[0].isdigit():
+                tot += int(ss[0]); src.add("schedstat")
+            else:
+                st = H.parse_task_stat(H.rd(tdir + "/stat"))
+                if not st:
+                    continue
+                tot += int((st["utime"] + st["stime"]) * 1e9 / H.TICK); src.add("stat-Ticks")
+            names.add(re.sub(r"\d+$", "#", tc))
+    return {"ns": tot, "quelle": "+".join(sorted(src)) or "keine", "threads": sorted(names)[:40]}
+
+def diretta_us(p_info, i_info, hz):
+    """zusaetzliche Rechenzeit je Diretta-Zyklus bei Wiedergabe [us] = (Rate P50 - Rate I50) / Zyklusrate."""
+    def rate(c):
+        a, b = c["c0"].get("diretta"), c["c1"].get("diretta")
+        return (b["ns"] - a["ns"]) / (c["c1"]["t"] - c["c0"]["t"]) if a and b and c["c1"]["t"] > c["c0"]["t"] else float("nan")
+    rp, ri = rate(p_info), rate(i_info)
+    return (rp - ri) / hz / 1000.0, rp / hz / 1000.0
+
 
 # ------------------------------------------------------------------ Zaehler
 def counters():
+    d = diretta_rt()          # vor dem Zeitstempel: Suche dauert einige 10 ms, Messfenster beginnt danach
     return {"t": H.now_boot(), "stat": H.rd("/proc/stat"), "interrupts": H.rd("/proc/interrupts"),
             "softirqs": H.rd("/proc/softirqs"), "netdev": H.rd("/proc/net/dev"),
-            "throttled": H.sh(["vcgencmd", "get_throttled"])}
+            "throttled": H.sh(["vcgencmd", "get_throttled"]), "diretta": d}
 
 def net_rates(a, b):
     dt = b["t"] - a["t"]; na, nb = H.parse_netdev(a["netdev"]), H.parse_netdev(b["netdev"]); out = {}
@@ -326,8 +426,8 @@ def net_rates(a, b):
 
 # ------------------------------------------------------------------ Versuchsreihe
 class Series:
-    def __init__(self, cdir, dur, with_music, kal_kurz=False):
-        self.dir, self.dur, self.music, self.kal_kurz = cdir, dur, with_music, kal_kurz
+    def __init__(self, cdir, dur, with_music, kal_kurz=False, mode="voll"):
+        self.dir, self.dur, self.music, self.kal_kurz, self.mode = cdir, dur, with_music, kal_kurz, mode
         self.raw = os.path.join(cdir, "raw"); os.makedirs(self.raw, exist_ok=True)
         self.children, self.gen, self.params, self.state = [], None, {}, None
 
@@ -353,14 +453,15 @@ class Series:
                 raise SystemExit("Zeitueberschreitung beim Warten auf: " + txt)
             time.sleep(1.0)
 
-    def condition(self, tag, hz, want_play, gen=None, dur=None):
+    def condition(self, tag, hz, want_play, gen=None, dur=None, pmic=False):
         only = os.environ.get("VS_ONLY")              # nur fuer Tests: Teilmenge der Bedingungen
         if only and tag not in only.split(","):
             return None
         dur = dur or self.dur
-        log("== %s: %s, %d Hz, %d s%s" % (tag, "Wiedergabe" if want_play else "Ruhe", hz, dur,
+        log("== %s: %s, %d Hz, %d s%s" % (tag, {True: "Wiedergabe", False: "Ruhe", None: "Musik egal"}[want_play], hz, dur,
                                          (", Last: " + gen[0]) if gen else ""))
-        self.wait_state(want_play)
+        if want_play is not None:
+            self.wait_state(want_play)
         cd = os.path.join(self.dir, tag); os.makedirs(cd, exist_ok=True)
         info = {"tag": tag, "hz": hz, "dur": dur, "want_play": want_play, "alsa_start": H.alsa_state()[1]}
         if gen:
@@ -369,6 +470,9 @@ class Series:
             time.sleep(3.0)                                   # Last laeuft vor Messbeginn eingeschwungen
         c0 = counters()
         smp = H.Sampler(os.path.join(cd, "sampler.json")); smp.start()
+        pm = PmicSampler() if pmic else None
+        if pm:
+            pm.start()
         outp = os.path.join(cd, "run_out.txt")
         env = dict(os.environ, EXT5V_CPU=H.LOGGER_CPU, EXT5V_OUT=self.raw)
         with open(outp, "w") as of:
@@ -384,6 +488,9 @@ class Series:
         except subprocess.TimeoutExpired:
             info["timeout"] = True; H.kill_group(p)
         self.children.remove(p)
+        if pm:
+            pm.stop_ev.set(); pm.join(10)
+            info["pmic"] = pm.rows; info["pmic_err"] = pm.err
         c1 = counters()
         smp.stop_ev.set(); smp.join(10)
         if self.gen:
@@ -394,7 +501,7 @@ class Series:
         info.update({"rc": p.returncode, "run_dir": os.path.relpath(runs[-1], self.dir) if runs else None,
                      "alsa_end": H.alsa_state()[1], "c0": c0, "c1": c1, "sampler_err": smp.err})
         H.wjson(os.path.join(cd, "cond.json"), info)
-        log("%s beendet: logger_rc=%s%s" % (tag, p.returncode, ("  Last %.1f/%.0f Hz" % (
+        log("%s beendet: logger_rc=%s%s" % (tag, p.returncode, ("  Last %.4g/%.4g Hz" % (
             info["gen"]["ist_hz"], info["gen"]["soll_hz"])) if "gen" in info else ""))
         return info
 
@@ -421,24 +528,60 @@ class Series:
         log("Nachbildung: end0 %.1f Pak/s x %d B, %s %.1f Pak/s x %d B, CPU-Wecker %.1f Hz (%s)" % (
             p["end0_hz"], p["end0_payload"], LAN, p["lan_hz"], p["lan_payload"], p["cpu_hz"], p["quelle"]))
 
+    def save_params(self):
+        H.wjson(os.path.join(self.dir, "params.json"), self.params)
+
+    def mech_params(self, P, I):
+        """C47/C47x: Soll-Rechenzeit je Weckvorgang aus P50-I50, Schleifen-Abgleich vor Ort."""
+        p = self.params; hz = p["cpu_hz"]
+        if not P or not I:
+            p["diretta_us"] = float("nan"); return False
+        extra, tot = diretta_us(P, I, hz)
+        if H.TEST and os.environ.get("VS_TEST_DIRETTA_US"):          # nur Selbsttest ausserhalb des Pi
+            extra = tot = float(os.environ["VS_TEST_DIRETTA_US"])
+        p.update({"diretta_us": extra, "diretta_us_gesamt": tot, "diretta_quelle": P["c1"]["diretta"]["quelle"],
+                  "diretta_threads": P["c1"]["diretta"]["threads"]})
+        if not (math.isfinite(extra) and extra > 0):
+            log("WARN  Diretta-Rechenzeit je Zyklus nicht bestimmbar (%s us) - C47 entfaellt" % fmt(extra)); self.save_params()
+            return False
+        ux = min(max(4 * extra, MECH_DUTY * 1e6 / hz), 0.15 * 1e6 / hz)
+        p["c47_busy_us"], p["c47_cpu_abgleich_us"] = tune_burst(extra, hz)
+        p["c47x_busy_us"], p["c47x_cpu_abgleich_us"] = tune_burst(ux, hz)
+        p["c47x_soll_us"] = ux
+        self.save_params()
+        log("Mechanismus: Diretta +%.1f us Rechenzeit je Zyklus (gesamt %.1f us, %s); C47 Soll %.1f us (Abgleich %.1f), "
+            "C47x Soll %.1f us (Abgleich %.1f)" % (extra, tot, p["diretta_quelle"], extra, p["c47_cpu_abgleich_us"], ux,
+                                                   p["c47x_cpu_abgleich_us"]))
+        return True
+
     def run(self):
+        if self.mode == "widerstand":
+            self.condition("R50", 50, None, ("Laststufe CPU0 %g Hz" % R_FREQ, R_FREQ, "rechteck"), pmic=True)
+            return
         P = None
         if self.music:
             P = self.condition("P50", 50, True)
             self.condition("P47", 47, True)
         self.derive(P)
         p = self.params
-        self.condition("I50", 50, False)
+        I = self.condition("I50", 50, False)
         self.condition("I47", 47, False)
+        mech = self.music and self.mech_params(P, I)
         self.condition("E50", 50, False, ("end0-Verkehr", p["end0_hz"], udp_sender(END0_DST, p["end0_payload"])))
         self.condition("E47", 47, False, ("end0-Verkehr", p["end0_hz"], udp_sender(END0_DST, p["end0_payload"])))
         self.condition("U50", 50, False, (LAN + "-Verkehr", p["lan_hz"], udp_sender(LAN_DST, p["lan_payload"])))
         self.condition("C50", 50, False, ("CPU0-Wecker 50us", p["cpu_hz"], cpu_burst(50)))
+        if mech:
+            self.condition("C47", 47, False, ("CPU0-Wecker wie Diretta %.0f us" % p["diretta_us"], p["cpu_hz"],
+                                              cpu_burst(p["c47_busy_us"])))
+            self.condition("C47x", 47, False, ("CPU0-Wecker Positivkontrolle %.0f us" % p["c47x_soll_us"], p["cpu_hz"],
+                                               cpu_burst(p["c47x_busy_us"])))
         self.condition("I50m", 50, False)                       # Drift-Klammer Mitte
         # Kalibrierung der Messkette: Frequenzgang mit identischer Rechtecklast
         for fk in (KAL_F if not self.kal_kurz else (KAL_LO, KAL_HI)):
             self.condition(ktag(fk), 50, False, ("Rechteck CPU0 %g Hz" % fk, fk, "rechteck"), dur=min(self.dur, KAL_DUR))
         self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"), dur=min(self.dur, KAL_DUR))
+        self.condition("R50", 50, False, ("Laststufe CPU0 %g Hz" % R_FREQ, R_FREQ, "rechteck"), pmic=True)
         self.condition("I50b", 50, False)
 
     def cleanup(self):
@@ -449,7 +592,7 @@ class Series:
             H.kill_group(p)
 
 
-def child_main(cdir, dur, music, lockfd, kal_kurz=False):
+def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll"):
     lock = os.fdopen(lockfd, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -459,15 +602,15 @@ def child_main(cdir, dur, music, lockfd, kal_kurz=False):
         os.sched_setaffinity(0, {H.CTL_CPU})
     except OSError as e:
         log("WARN  CPU-Bindung nicht moeglich: %s" % e)
-    s = Series(cdir, dur, music, kal_kurz)
+    s = Series(cdir, dur, music, kal_kurz, mode)
     def on_term(*_):
         raise SystemExit("durch stop beendet")
     signal.signal(signal.SIGTERM, on_term)
     rc, done = 0, False
     try:
-        pre = preflight()
+        pre = preflight(mode)
         H.wjson(os.path.join(cdir, "series.json"), {"version": VERSION, "hostmess": H.VERSION, "dur": dur,
-                "music": music, "kal_kurz": kal_kurz, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
+                "music": music, "kal_kurz": kal_kurz, "modus": mode, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
                 "kernel": os.uname().release, "pid": os.getpid(), "pre": pre,
                 "env": {k: v for k, v in os.environ.items() if k.startswith(("VS_", "HOSTMESS_"))},
                 "diretta_setting": H.rd("/opt/diretta-alsa/setting.inf", None), "test_mode": H.TEST})
@@ -512,8 +655,8 @@ def write_sums(cdir, dst):
     with open(os.path.join(dst, "SHA256SUMS"), "w") as f:
         f.write("".join("%s  %s\n" % (h, n) for n, h in sorted(sums)))
 
-def preflight():
-    log("== Vorpruefung")
+def preflight(mode="voll"):
+    log("== Vorpruefung (%s)" % mode)
     errs = []
     model = H.rd("/proc/device-tree/model").replace("\0", "").strip()
     if not model.startswith("Raspberry Pi 5") and not H.TEST:
@@ -533,23 +676,28 @@ def preflight():
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(fh, fcntl.LOCK_UN)
         except OSError:
             errs.append("hostmess.py-Messung laeuft gerade")
-    if not glob.glob(H.ALSA_GLOB):
-        errs.append("kein ALSA-Wiedergabegeraet")
-    nd = H.parse_netdev(H.rd("/proc/net/dev"))
-    for i in (END0, LAN):
-        if i not in nd and not H.TEST:
-            errs.append("Netzwerkschnittstelle fehlt: " + i)
-    for dst in (END0_DST, LAN_DST):
-        try:
-            socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"vs", (dst, 9))
-        except OSError as e:
-            errs.append("Ziel %s nicht erreichbar: %s" % (dst, e))
+    p_, u_, rails_ = parse_pmic(H.sh(["vcgencmd", "pmic_read_adc"], timeout=5))
+    if not (math.isfinite(p_) and "VDD_CORE" in rails_ and math.isfinite(u_)):
+        errs.append("vcgencmd pmic_read_adc liefert keine Schienenstroeme (VDD_CORE/EXT5V)")
+    if mode == "voll":
+        if not glob.glob(H.ALSA_GLOB):
+            errs.append("kein ALSA-Wiedergabegeraet")
+        nd = H.parse_netdev(H.rd("/proc/net/dev"))
+        for i in (END0, LAN):
+            if i not in nd and not H.TEST:
+                errs.append("Netzwerkschnittstelle fehlt: " + i)
+        for dst in (END0_DST, LAN_DST):
+            try:
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"vs", (dst, 9))
+            except OSError as e:
+                errs.append("Ziel %s nicht erreichbar: %s" % (dst, e))
     if errs:
         for e in errs:
             log("FEHLER " + e)
         raise SystemExit("Vorpruefung nicht bestanden - nichts gemessen")
-    log("OK    %s, Schnittstellen %s/%s, Ziele %s/%s" % (model or "?", END0, LAN, END0_DST, LAN_DST))
-    return {"model": model}
+    log("OK    %s, PMIC %.2f W / EXT5V %.3f V%s" % (model or "?", p_, u_, (", Schnittstellen %s/%s, Ziele %s/%s" % (
+        END0, LAN, END0_DST, LAN_DST)) if mode == "voll" else ""))
+    return {"model": model, "pmic_w": p_}
 
 
 # ------------------------------------------------------------------ Auswertung
@@ -557,7 +705,8 @@ def ktag(f):
     return "K%d" % int(f)        # 3,1 -> K3, 7,3 -> K7, 31 -> K31, 213 -> K213
 
 KTAGS = [ktag(f) for f in KAL_F]
-TAGS = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "I50m"] + KTAGS + ["K213b", "I50b"]
+TAGS = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "C47", "C47x", "I50m"] + KTAGS + ["K213b", "R50", "I50b"]
+NEW13 = ("C47", "C47x", "R50")                     # erst ab v1.3
 IDLE_REF = ("I50", "I50m", "I50b")
 
 def temp_of(c):
@@ -580,7 +729,7 @@ def load_cond(cdir, tag):
     fs = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else float("nan")
     dts = [b - a for a, b in zip(t, t[1:])]
     al = [r["alsa"] for r in smp]
-    info.update({"v": v, "fs": fs, "dt_max": max(dts) if dts else float("nan"),
+    info.update({"v": v, "t": t, "fs": fs, "dt_max": max(dts) if dts else float("nan"),
                  "dt_gaps": sum(1 for d in dts if d > 1.5 / info["hz"]),
                  "alsa_frac": 100.0 * sum(al) / len(al) if al else float("nan"),
                  "rates": sorted({r["rate"] for r in smp if r.get("rate")}), "rows": smp})
@@ -593,7 +742,7 @@ def metrics(c):
         return m
     m.update({"mean": H.mean(v), "sd": H.sdev(v), "p01": pct(s, 0.1), "p999": pct(s, 99.9), "min": s[0], "max": s[-1]})
     f, p = welch(v, c["fs"])
-    m["f"], m["psd"] = f, p
+    m["f"], m["psd"], m["v"] = f, p, v
     m["df"] = f[1] - f[0] if len(f) > 1 else float("nan")
     m["bands"] = [band_rms(f, p, lo, hi) for lo, hi in BANDS]
     m["var_hf"] = band_rms(f, p, VAR_FMIN, 1e9) ** 2 if f else float("nan")   # Varianz ohne Drift < 0,1 Hz [mV^2]
@@ -625,20 +774,32 @@ def checks_for(tag, c, m, params):
     out = [("%s: logger_rc=0" % tag, c.get("rc") == 0 and not c.get("timeout") and c.get("logger_start") is not None),
            ("%s: Daten vollstaendig (N=%d, Soll %d)" % (tag, m["n"], c["dur"] * c["hz"]), m["n"] >= 0.98 * c["dur"] * c["hz"]),
            ("%s: Abtastrate %.3f Hz (Soll %d)" % (tag, m["fs"], c["hz"]), abs(m["fs"] - c["hz"]) < 0.01 * c["hz"]),
-           ("%s: Abtastung gleichmaessig (max dt %s ms, Luecken %d)" % (tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]),
-            c["dt_gaps"] == 0),
-           ("%s: Wiedergabe %s (ist %.0f %%)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"]),
-            abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) < 1e-9),
+           (("%s: Abtastung gleichmaessig (max dt %s ms, Luecken %d)" % (tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]),
+             c["dt_gaps"] == 0) if "pmic" not in c else
+            # R50 fragt parallel den PMIC ab; einzelne Luecken stoeren Halbperioden-Mittel nicht
+            ("%s: Abtastung ausreichend gleichmaessig trotz PMIC-Abfrage (max dt %s ms, Luecken %d <= 0,5 %%)" % (
+                tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]), c["dt_gaps"] <= 0.005 * m["n"] and c["dt_max"] < 0.2)),
+           (("%s: Wiedergabe %s (ist %.0f %%)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"]),
+             abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) < 1e-9) if c["want_play"] is not None else
+            ("%s: Musikzustand waehrend der Messung konstant (Wiedergabe %.0f %%)" % (tag, c["alsa_frac"]),
+             c["alsa_frac"] in (0.0, 100.0))),
            ("%s: keine Unterspannung/Drosselung" % tag, m.get("thr_ok", False)),
            ("%s: Sampler ohne Fehler" % tag, c.get("sampler_err") is None)]
-    if c["want_play"]:
+    if c["want_play"] or (c["want_play"] is None and c["alsa_frac"] == 100.0):
         out.append(("%s: Abtastrate Musik konstant %s" % (tag, c["rates"]), len(c["rates"]) == 1))
     g = c.get("gen")
     if g:
-        out.append(("%s: Last %.1f von %.1f Hz, Verzug p99 %.2f ms, >1 ms %.1f %%, Fehler %d" % (tag, g["ist_hz"], g["soll_hz"],
-                    g["verzug_p99_ms"], g.get("anteil_ueber_1ms", float("nan")), g["fehler"]),
-                    abs(g["ist_hz"] - g["soll_hz"]) <= 0.02 * g["soll_hz"] and g["fehler"] == 0 and g["verzug_p99_ms"] < (
+        dt_ = g.get("dauer_s") or (g["n"] / g["ist_hz"] if g["ist_hz"] > 0 else 0.0)
+        soll_n = g["soll_hz"] * dt_          # Anzahl statt Rate: bei 0,1 Hz zaehlt der erste Aufruf sonst 5 % mit
+        out.append(("%s: Last %.1f von %.1f Hz (%d von %.1f Aufrufen), Verzug p99 %.2f ms, >1 ms %.1f %%, Fehler %d" % (
+                    tag, g["ist_hz"], g["soll_hz"], g["n"], soll_n, g["verzug_p99_ms"], g.get("anteil_ueber_1ms", float("nan")),
+                    g["fehler"]),
+                    abs(g["n"] - soll_n) <= max(1.5, 0.02 * soll_n) and g["fehler"] == 0 and g["verzug_p99_ms"] < (
                         0.25 * 1000.0 / g["soll_hz"] if "rechteck_hz" in g else 2.0)))   # Rechteck: <25 % der Halbperiode
+    if "pmic" in c:
+        n_exp = c["dur"] / PMIC_DT
+        out.append(("%s: PMIC-Abfragen %d (Soll ~%.0f), Fehler %d" % (tag, len(c["pmic"]), n_exp, c.get("pmic_err", 0)),
+                    len(c["pmic"]) >= 0.6 * n_exp and c.get("pmic_err", 0) == 0))
         iface = {"E": params.get("end0_if", END0), "U": params.get("lan_if", LAN)}.get(tag[0])
         if iface and "net" in m:
             base = 0.0
@@ -689,6 +850,91 @@ def source_search(M, f0, span=25.0, step=0.01):
             out.append([h])
     return [(g[0][0], g[-1][0], g[len(g) // 2]) for g in out]
 
+def r_analysis(c):
+    """R50: Spannungs- und Leistungshub je Lastwechsel. Jede Last-an-Halbperiode gegen das Mittel ihrer beiden
+    Nachbarn (Last aus) -> lineare Drift faellt heraus. Ergebnis None, wenn Grunddaten fehlen."""
+    g = c.get("gen") or {}; tog = g.get("toggles") or []; rows = c.get("pmic") or []
+    t0 = c.get("logger_start"); v = c.get("v") or []
+    if len(tog) < 4 or not rows or not v or t0 is None or not math.isfinite(c.get("fs", float("nan"))):
+        return None
+    t = [t0 + x for x in c["t"]]                 # Logger-Zeit -> CLOCK_BOOTTIME (wie Umschalt- und PMIC-Zeiten)
+    halves = []
+    for (ta, on), (tb, _) in zip(tog, tog[1:]):
+        a, b = ta + R_SKIP, tb - 0.2
+        vs = [x for tt, x in zip(t, v) if a <= tt < b]
+        rs = [r for r in rows if a <= r["t"] < b]
+        if b <= a or len(vs) < 0.8 * (b - a) * c["fs"] or len(rs) < 3:
+            halves.append(None); continue
+        halves.append((on, H.mean(vs), H.mean([r["p"] for r in rs]), H.mean([r["ext5v"] for r in rs])))
+    dv, dp = [], []
+    for i in range(1, len(halves) - 1):
+        h, a, b = halves[i], halves[i - 1], halves[i + 1]
+        if h and a and b and h[0] and not a[0] and not b[0]:
+            dv.append((a[1] + b[1]) / 2 - h[1]); dp.append(h[2] - (a[2] + b[2]) / 2)
+    out = {"n": len(dv)}
+    if len(dv) < 2:
+        return out
+    se = lambda x: H.sdev(x) / math.sqrt(len(x))
+    vin = H.mean([h[3] for h in halves if h])
+    dV, dP = H.mean(dv), H.mean(dp)
+    out.update({"dv": dV, "dv_se": se(dv), "dp": dP, "dp_se": se(dp), "vin": vin,
+                "r": {e: (dV / 1000.0) / (dP / (e * vin)) if dP > 0 and vin > 0 else float("nan") for e in ETA}})
+    return out
+
+def line_at(M, t, fsrc):
+    """Linie einer Quelle fsrc im Spektrum der Bedingung t: Alias, rms, Faktor ggue. Ruhe gleicher Rate, signifikant?"""
+    m = M.get(t)
+    if not m or "f" not in m or not math.isfinite(fsrc):
+        return None
+    fa = alias(fsrc, m["fs"])
+    if not testable(fa, m):
+        return {"fa": fa, "a": float("nan"), "rr": float("nan"), "det": m.get("det_rms", float("nan")), "se": float("nan"),
+                "sig": False}
+    a = peak_rms(m, fa); rr, _ = excess(m, M.get("I47" if "47" in t else "I50"), fa, 0.15)
+    det, se = m.get("det_rms", float("nan")), line_se(m, fa)
+    # signifikant: >= 4x Ruhe UND >= 3 Standardfehler (Bloecke). Nachweisgrenze det nur ohne Blockfehler: bei
+    # linienreichen Spektren (Pulsfolgen falten viele Oberwellen ein) liegt deren Median nicht mehr am Rauschen.
+    strong = a >= 3 * se if math.isfinite(se) else (math.isfinite(det) and a >= det)
+    return {"fa": fa, "a": a, "rr": rr, "det": det, "se": se, "sig": rr >= 4 and math.isfinite(a) and strong}
+
+def line_se(m, fa, nblk=4):
+    """Standardfehler einer Linien-rms aus nblk unabhaengigen Zeitbloecken (empirisch, kein Rauschmodell)."""
+    v = m.get("v"); n = len(v) // nblk if v else 0
+    if n < 2 * NSEG:
+        return float("nan")
+    vals = []
+    for b in range(nblk):
+        f, p = welch(v[b * n:(b + 1) * n], m["fs"]); vals.append(peak_rms({"f": f, "psd": p}, fa))
+    return H.sdev(vals) / math.sqrt(nblk)
+
+def spin(us, f):
+    """Grundwellen-Gewicht einer Pulsfolge: Pulsdauer us bei Rate f -> sin(pi*d) (Amplitude ~ Hoehe * sin(pi*d))."""
+    return math.sin(math.pi * min(0.5, max(0.0, us * 1e-6 * f)))
+
+def mechanism(M, C, params):
+    """Anteil des Prozessor-Aufwachens an der Diretta-500-Hz-Linie (P47), skaliert ueber die Positivkontrolle C47x."""
+    ut, fz = params.get("diretta_us", float("nan")), params.get("end0_hz", float("nan"))
+    if not (math.isfinite(ut) and ut > 0) or not all(t in C and C[t].get("gen") for t in ("C47", "C47x")):
+        return None
+    g1, gx = C["C47"]["gen"], C["C47x"]["gen"]
+    r = {"ut": ut, "fz": fz, "u1": g1["cpu_us_je_aufruf"], "ux": gx["cpu_us_je_aufruf"], "f1": g1["ist_hz"], "fx": gx["ist_hz"],
+         "P": line_at(M, "P47", fz), "P2": line_at(M, "P47", 2 * fz), "L1": line_at(M, "C47", g1["ist_hz"]),
+         "LX": line_at(M, "C47x", gx["ist_hz"]), "LX2": line_at(M, "C47x", 2 * gx["ist_hz"])}
+    if not (r["P"] and r["LX"] and r["L1"]) or not all(math.isfinite(r[k]) and r[k] > 0 for k in ("u1", "ux")):
+        return r
+    k = r["LX"]["a"] / spin(r["ux"], r["fx"])          # mV rms je Einheit sin(pi*d) bei voller Kernlast-Hoehe
+    r["pred"] = k * spin(ut, fz)                        # erwartete Linie, wenn nur Diretta-Rechenzeit wirkte
+    r["pred1"] = k * spin(r["u1"], r["f1"])             # erwartete Linie in C47 (Linearitaetsprobe)
+    r["ratio"] = r["pred"] / r["P"]["a"] if r["P"]["sig"] and r["P"]["a"] > 0 else float("nan")
+    rel = lambda x: x["se"] / x["a"] if x["a"] > 0 else float("nan")
+    r["ratio_se"] = abs(r["ratio"]) * math.hypot(rel(r["LX"]), rel(r["P"]))
+    if "E47" in C and C["E47"].get("gen"):
+        ge = C["E47"]["gen"]; le = line_at(M, "E47", ge["ist_hz"])
+        ue = ge.get("cpu_us_je_aufruf", float("nan"))
+        if le and math.isfinite(ue):
+            r.update({"LE": le, "ue": ue, "pred_e_cpu": k * spin(ue, ge["ist_hz"])})
+    return r
+
 def analyse(cdir):
     L, S, checks = [], [], []
     try:
@@ -702,8 +948,15 @@ def analyse(cdir):
     params = H.rjson(pp) if os.path.isfile(pp) else {}
     lan = params.get("lan_if", LAN)
     C, M = {}, {}
-    soll = [t for t in (TAGS if meta.get("music") else TAGS[2:])
-            if not (meta.get("kal_kurz") and t in KTAGS and t not in (ktag(KAL_LO), ktag(KAL_HI)))]
+    mode = meta.get("modus", "voll")
+    v13 = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:2]) >= (1, 3)
+    if mode == "widerstand":
+        soll = ["R50"]
+    else:
+        soll = [t for t in TAGS
+                if (meta.get("music") or t not in ("P50", "P47", "C47", "C47x"))
+                and (v13 or t not in NEW13)
+                and not (meta.get("kal_kurz") and t in KTAGS and t not in (ktag(KAL_LO), ktag(KAL_HI)))]
     for t in soll:
         c = load_cond(cdir, t)
         if c is None:
@@ -711,7 +964,7 @@ def analyse(cdir):
         C[t] = c
         M[t] = metrics(c) if "defekt" not in c else {}
         checks += checks_for(t, c, M[t], params)
-    if not meta.get("music"):
+    if not meta.get("music") and mode != "widerstand":
         S.append("HINWEIS: ohne Musik gemessen - kein P50/P47, Alias-Nachweis und Varianzanteile nicht moeglich.")
         L.append(S[-1])
     if params:
@@ -740,51 +993,52 @@ def analyse(cdir):
         sp = sig_peaks(m, ref)[:4]
         txt = "; ".join("%.2f/%.0f/%.2f/%.0f" % pk for pk in sp) or "keine"
         L.append("  %-5s %s" % (t, txt)); S.append("  %-5s %s" % (t, txt))
-    # Alias-Test
-    L.append(""); S.append("")
-    L.append("Alias-Test (Vorhersage aus gemessener Abtastrate; Faktor ggue. Ruhe/Umgebung; SPITZE wenn >=4 und >=10;"
-             " 'n.p.' = Alias liegt bei 0 Hz oder Nyquist, nicht pruefbar):"); S.append("Alias-Test:")
-    cands = []
-    if params:
-        fz = params["end0_hz"]
-        cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
-                 ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
-    cands += [("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47")),
-              ("60 Hz", 60.0, ("I50", "I47", "P50", "P47")), ("120 Hz", 120.0, ("I50", "I47", "P50", "P47"))]
-    for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
-        if t in C and C[t].get("gen"):
-            cands.append(("%s erzeugt" % t, C[t]["gen"]["ist_hz"], (t,)))
-    for name, fsrc, conds in cands:
-        res = []
-        for t in conds:
-            m = M.get(t)
-            if not m or "f" not in m:
-                continue
-            fa = alias(fsrc, m["fs"])
-            if not testable(fa, m):
-                res.append("%s %.2f Hz n.p." % (t, fa)); continue
-            ref_t = "I47" if t.endswith("47") else "I50"
-            if t == ref_t:      # Ruhe gegen sich selbst nicht vergleichbar: nur Umgebung
-                _, loc = excess(m, m, fa)
-                res.append("%s %.2f Hz -/%s%s" % (t, fa, fmt(loc, 0), " SPITZE(Umgebung)" if loc >= 10 else ""))
-                continue
-            rr, loc = excess(m, M.get(ref_t), fa)
-            res.append("%s %.2f Hz %s/%s%s" % (t, fa, fmt(rr, 0), fmt(loc, 0), " SPITZE" if rr >= 4 and loc >= 10 else ""))
-        line = "  %-15s %7.2f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
-        L.append(line); S.append(line)
-    if params:
-        for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
-            ivs = source_search(M, f0)
-            fit_ = kal_fit(M, C)[1]
-            def corr(fq, rms):
-                if not fit_:
-                    return ""
-                hq = sinc_h(fq, fit_[0])
-                return ", korrigiert %s mV (H=%.2f, Modell)" % (fmt(rms / hq), hq) if hq >= 0.2 else ", H=%.2f zu klein fuer Korrektur" % hq
-            line = "  Quellsuche %s +-25 Hz (Spitze in P47 und P50, oder P50 blind): %s" % (name, "; ".join(
-                "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
-                ", P50 blind" if math.isnan(h[3]) else "", corr(h[0], h[4])) for a, b, h in ivs) or "kein Treffer")
+    if mode != "widerstand":
+        # Alias-Test
+        L.append(""); S.append("")
+        L.append("Alias-Test (Vorhersage aus gemessener Abtastrate; Faktor ggue. Ruhe/Umgebung; SPITZE wenn >=4 und >=10;"
+                 " 'n.p.' = Alias liegt bei 0 Hz oder Nyquist, nicht pruefbar):"); S.append("Alias-Test:")
+        cands = []
+        if params:
+            fz = params["end0_hz"]
+            cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
+                     ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
+        cands += [("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47")),
+                  ("60 Hz", 60.0, ("I50", "I47", "P50", "P47")), ("120 Hz", 120.0, ("I50", "I47", "P50", "P47"))]
+        for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
+            if t in C and C[t].get("gen"):
+                cands.append(("%s erzeugt" % t, C[t]["gen"]["ist_hz"], (t,)))
+        for name, fsrc, conds in cands:
+            res = []
+            for t in conds:
+                m = M.get(t)
+                if not m or "f" not in m:
+                    continue
+                fa = alias(fsrc, m["fs"])
+                if not testable(fa, m):
+                    res.append("%s %.2f Hz n.p." % (t, fa)); continue
+                ref_t = "I47" if t.endswith("47") else "I50"
+                if t == ref_t:      # Ruhe gegen sich selbst nicht vergleichbar: nur Umgebung
+                    _, loc = excess(m, m, fa)
+                    res.append("%s %.2f Hz -/%s%s" % (t, fa, fmt(loc, 0), " SPITZE(Umgebung)" if loc >= 10 else ""))
+                    continue
+                rr, loc = excess(m, M.get(ref_t), fa)
+                res.append("%s %.2f Hz %s/%s%s" % (t, fa, fmt(rr, 0), fmt(loc, 0), " SPITZE" if rr >= 4 and loc >= 10 else ""))
+            line = "  %-15s %7.2f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
             L.append(line); S.append(line)
+        if params:
+            for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
+                ivs = source_search(M, f0)
+                fit_ = kal_fit(M, C)[1]
+                def corr(fq, rms):
+                    if not fit_:
+                        return ""
+                    hq = sinc_h(fq, fit_[0])
+                    return ", korrigiert %s mV (H=%.2f, Modell)" % (fmt(rms / hq), hq) if hq >= 0.2 else ", H=%.2f zu klein fuer Korrektur" % hq
+                line = "  Quellsuche %s +-25 Hz (Spitze in P47 und P50, oder P50 blind): %s" % (name, "; ".join(
+                    "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
+                    ", P50 blind" if math.isnan(h[3]) else "", corr(h[0], h[4])) for a, b, h in ivs) or "kein Treffer")
+                L.append(line); S.append(line)
     # Varianzanteile (ohne Drift < 0,1 Hz)
     if all(t in M and "var_hf" in M[t] for t in ("I50", "P50")):
         vi, vp = M["I50"]["var_hf"], M["P50"]["var_hf"]
@@ -858,6 +1112,92 @@ def analyse(cdir):
                 rate, dev), abs(dev) <= 1.5))
         rv = M["I50b"]["var_hf"] / M["I50"]["var_hf"] if M["I50"]["var_hf"] > 0 else float("nan")
         checks.append(("Ruhe-Schwankung reproduzierbar (Varianz I50b/I50 x%.2f, 0,75..1,33)" % rv, 0.75 <= rv <= 1.33))
+    # Mechanismus: Prozessor oder Netzwerk-Hardware?
+    mech = mechanism(M, C, params) if mode != "widerstand" else None
+    if mech is not None:
+        L.append(""); S.append("")
+        hd = "Mechanismus 500-Hz-Linie (@47 Hz; Prozessor-Anteil ueber Positivkontrolle C47x skaliert):"
+        L.append(hd); S.append(hd)
+        P, L1, LX = mech["P"], mech["L1"], mech["LX"]
+        def ln(x):
+            return "n/a" if not x else "%s +- %s mV @%.2f Hz (x%s Ruhe, Nachweisgr. %s)%s" % (
+                fmt(x["a"]), fmt(x["se"]), x["fa"], fmt(x["rr"], 0), fmt(x["det"]), "" if x["sig"] else " nicht signifikant")
+        for lab, x in (("Diretta P47 500 Hz", P), ("Diretta P47 1000 Hz", mech["P2"]), ("C47  Wecker %.1f us" % mech["u1"], L1),
+                       ("C47x Wecker %.1f us" % mech["ux"], LX), ("C47x 1000 Hz", mech["LX2"])):
+            line = "  %-22s %s" % (lab, ln(x)); L.append(line); S.append(line)
+        line = "  Diretta-Rechenzeit je Zyklus bei Wiedergabe: +%.1f us (P50-I50, %s)" % (mech["ut"], params.get("diretta_quelle", "?"))
+        L.append(line); S.append(line)
+        if params.get("diretta_threads"):
+            L.append("    erfasste Threads: " + ", ".join(params["diretta_threads"]))
+        if "pred" in mech:
+            ok_x = bool(LX and LX["sig"])
+            checks.append(("Mechanismus: Positivkontrolle C47x sichtbar (%s mV, Nachweisgrenze %s)" % (fmt(LX["a"]), fmt(LX["det"])), ok_x))
+            checks.append(("Mechanismus: Diretta-Linie in P47 signifikant (%s mV)" % fmt(P["a"]), bool(P and P["sig"])))
+            if L1["sig"]:
+                lin = L1["a"] / mech["pred1"] if mech["pred1"] > 0 else float("nan")
+                checks.append(("Mechanismus: C47 bestaetigt Linearitaet (gemessen %s / erwartet %s mV = x%s, 0,67..1,5)" % (
+                    fmt(L1["a"]), fmt(mech["pred1"]), fmt(lin)), 0.67 <= lin <= 1.5))
+            else:
+                lim = L1["a"] + 3 * L1["se"] if math.isfinite(L1["se"]) else 1.5 * L1["det"]
+                checks.append(("Mechanismus: C47 nicht signifikant, passt zur Erwartung (erwartet %s, gemessen %s +- %s mV)" % (
+                    fmt(mech["pred1"]), fmt(L1["a"]), fmt(L1["se"])), mech["pred1"] <= lim))
+            line = "  Erwartet allein aus Diretta-Rechenzeit: %s mV = %s +- %s %% der gemessenen Diretta-Linie (+- = 1 Standardfehler)" % (
+                fmt(mech["pred"]), fmt(100 * mech["ratio"], 0), fmt(100 * mech["ratio_se"], 0))
+            L.append(line); S.append(line)
+            if "LE" in mech:
+                net = mech["LE"]["a"] - mech["pred_e_cpu"]
+                line = "  E47 (end0-Nachbildung): Linie %s mV, davon Prozessor ~%s mV (%.1f us je Paket) -> Netzwerk-Hardware ~%s mV (%s %% der Diretta-Linie)" % (
+                    fmt(mech["LE"]["a"]), fmt(mech["pred_e_cpu"]), mech["ue"], fmt(net),
+                    fmt(100 * net / P["a"], 0) if P and P["a"] > 0 else "n/a")
+                L.append(line); S.append(line)
+            q = mech["ratio"]
+            if not (ok_x and P and P["sig"] and math.isfinite(q)):
+                v_ = "nicht entscheidbar (Pruefung oben fehlgeschlagen)"
+            elif not math.isfinite(mech["ratio_se"]) or mech["ratio_se"] > 0.2:
+                v_ = "UNSICHER: Prozessor ~%.0f %% +- %.0f %% - Streuung zu gross, Messung mit --dur 360 wiederholen" % (
+                    100 * q, 100 * mech["ratio_se"])
+            elif q >= 0.7:
+                v_ = "PROZESSOR: das Aufwachen der CPU erklaert den Grossteil (>= 70 %) der 500-Hz-Linie"
+            elif q <= 0.3:
+                v_ = "NETZWERK-HARDWARE: der Prozessor erklaert hoechstens ~30 %, Hauptanteil end0-Sender/PHY/DMA"
+            else:
+                v_ = "GEMISCHT: Prozessor ~%.0f %%, Rest Netzwerk-Hardware" % (100 * q)
+            line = "  ERGEBNIS: " + v_; L.append(line); S.append(line)
+            line = ("  Annahmen: gleiche Stromaufnahme je Rechenzeit (Python-Schleife vs. Diretta-Code); Amplituden mehrerer Quellen"
+                    " addieren je nach Phase - Anteile sind Richtwerte.")
+            L.append(line); S.append(line)
+    # Zuleitungswiderstand
+    if "R50" in C and "defekt" not in C["R50"]:
+        ra = r_analysis(C["R50"])
+        L.append(""); S.append("")
+        if not ra or ra.get("n", 0) < 2:
+            line = "Zuleitungswiderstand (R50): nicht auswertbar (%s Lastwechsel)" % (ra or {}).get("n", 0)
+            L.append(line); S.append(line)
+            checks.append(("R50: mindestens 4 Lastwechsel auswertbar (%d)" % (ra or {}).get("n", 0), False))
+        else:
+            rr_ = ra["r"]
+            for line in ("Zuleitungswiderstand (R50: 1 Kern CPU0, 10 s an / 10 s aus, %d Lastwechsel):" % ra["n"],
+                         "  Spannungshub %.2f +- %.2f mV | Leistungshub PMIC-Schienen %.3f +- %.3f W | EXT5V %.3f V" % (
+                             ra["dv"], ra["dv_se"], ra["dp"], ra["dp_se"], ra["vin"]),
+                         "  R (Netzteil + Kabel + Stecker + Adapter + Pi-Eingang) = %s mOhm bei Wirkungsgrad %.1f %% (Spanne %s-%s mOhm fuer %.0f-%.0f %%)" % (
+                             fmt(1000 * rr_[ETA[1]], 1), 100 * ETA[1], fmt(1000 * rr_[ETA[0]], 1), fmt(1000 * rr_[ETA[2]], 1),
+                             100 * ETA[0], 100 * ETA[2])):
+                L.append(line); S.append(line)
+            checks.append(("R50: mindestens 4 Lastwechsel auswertbar (%d)" % ra["n"], ra["n"] >= 4))
+            zv = ra["dv"] / ra["dv_se"] if ra["dv_se"] > 0 else float("inf")
+            zp = ra["dp"] / ra["dp_se"] if ra["dp_se"] > 0 else float("inf")
+            checks.append(("R50: Spannungshub klar ueber Rauschen (%.1f mV = %.1f-fach Standardfehler, >= 10)" % (ra["dv"], zv),
+                           ra["dv"] > 0 and zv >= 10))
+            checks.append(("R50: Leistungshub klar und plausibel (%.3f W = %.1f-fach Standardfehler; 0,3..5 W)" % (ra["dp"], zp),
+                           0.3 <= ra["dp"] <= 5.0 and zp >= 10))
+            if fit:
+                hub = fit[1] / SQ_FUND; q = ra["dv"] / hub if hub > 0 else float("nan")
+                line = "  Gegenprobe: Hub je Kern aus Frequenzgang-Kalibrierung %.1f mV -> Laststufe/Kalibrierung x%.2f" % (hub, q)
+                L.append(line); S.append(line)
+                checks.append(("R50: Laststufe stimmt mit Frequenzgang-Kalibrierung ueberein (x%.2f, 0,75..1,33)" % q, 0.75 <= q <= 1.33))
+            line = ("  Hinweis: Wirkungsgrad der PMIC-Wandler nicht messbar (Annahme %.0f-%.0f %%); fuer Vorher/Nachher-Vergleiche"
+                    " am selben Pi kuerzt er sich heraus." % (100 * ETA[0], 100 * ETA[2]))
+            L.append(line); S.append(line)
     # Aktivitaet (Vollbericht)
     L.append(""); L.append("Aktivitaet je Bedingung:")
     for t in TAGS:
@@ -893,6 +1233,12 @@ def compare(a, b):
             continue
         out.append("%-5s %6.2f %6.2f %+6.2f | %6.2f / %6.2f | %8.4f %8.4f | %s/%s" % (t, ma["sd"], mb["sd"], mb["sd"] - ma["sd"],
                    ma["var_hf"], mb["var_hf"], ma["mean"] / 1000, mb["mean"] / 1000, fmt(ma["bands"][2]), fmt(mb["bands"][2])))
+        if t == "R50":
+            ra, rb = r_analysis(ca), r_analysis(cb)
+            if ra and rb and "r" in ra and "r" in rb:
+                e = ETA[1]
+                out.append("      Zuleitung: Hub %.2f+-%.2f / %.2f+-%.2f mV je Kern | R %s / %s mOhm (Wirkungsgrad %.1f %% angenommen)" % (
+                    ra["dv"], ra["dv_se"], rb["dv"], rb["dv_se"], fmt(1000 * ra["r"][e], 1), fmt(1000 * rb["r"][e], 1), 100 * e))
     return "\n".join(out) + "\n"
 
 
@@ -964,6 +1310,67 @@ def selftest():
     pc = Pacer(500.0, lambda: cnt.append(1), "t"); pc.start(); time.sleep(1.0); pc.stop_ev.set(); pc.join()
     st = pc.stats()
     chk(abs(st["ist_hz"] - 500) < 15, "Pacer 500 Hz -> %.1f Hz, p99 Verzug %.3f ms" % (st["ist_hz"], st["verzug_p99_ms"]))
+    # --- v1.3: PMIC, Widerstand, Mechanismus
+    txt = ("   VDD_CORE_A current(7)=2.00000000A\n   3V3_SYS_A current(1)=0.10000000A\n   VDD_CORE_V volt(15)=0.90000000V\n"
+           "   3V3_SYS_V volt(9)=3.30000000V\n   EXT5V_V volt(24)=5.10000000V\n   BATT_V volt(25)=0.00000000V\n")
+    pw, u5, rl = parse_pmic(txt)
+    chk(abs(pw - 2.13) < 1e-9 and abs(u5 - 5.1) < 1e-9 and set(rl) == {"VDD_CORE", "3V3_SYS"},
+        "PMIC-Auswertung: %.3f W (Soll 2,130), EXT5V %.2f V" % (pw, u5))
+    t0 = 1000.0; fs_ = 50.0; tt = [i / fs_ for i in range(int(180 * fs_))]
+    tog = [(t0 - 3.0 + 10.0 * k, k % 2 == 1) for k in range(20)]     # t0-3: Last aus, t0+7: an, ...
+    def on_at(ta):
+        st = False
+        for tk, o in tog:
+            if tk <= ta:
+                st = o
+        return st
+    vv = [5000.0 - 25.0 * on_at(t0 + x) + 0.6 * x / 60.0 + random.gauss(0, 0.8) for x in tt]
+    rows = [{"t": t0 + 0.5 * k, "p": 3.0 + 1.5 * on_at(t0 + 0.5 * k) + random.gauss(0, 0.01), "ext5v": 5.0}
+            for k in range(360)]
+    ra = r_analysis({"gen": {"toggles": tog}, "pmic": rows, "logger_start": t0, "v": vv, "t": tt, "fs": fs_})
+    rexp = 0.025 / (1.5 / (ETA[1] * 5.0))
+    chk(ra and ra["n"] >= 7 and abs(ra["r"][ETA[1]] / rexp - 1) < 0.02 and abs(ra["dv"] - 25) < 0.5,
+        "Widerstand synthetisch (25 mV, 1,5 W, Drift 0,6 mV/min): %s mOhm (Soll %.1f), %d Wechsel" % (
+            fmt(1000 * ra["r"][ETA[1]], 1) if ra and "r" in ra else "n/a", 1000 * rexp, ra["n"] if ra else 0))
+    def pulses(h, us, f, fs, dur=180.0, noise=0.5, extra=None):
+        d = us * 1e-6 * f
+        return [-(h if (i / fs * f) % 1.0 < d else 0.0) + random.gauss(0, noise) + (extra(i / fs) if extra else 0.0)
+                for i in range(int(dur * fs))]
+    def mkm(v, fs):
+        f, p = welch(v, fs); df = f[1] - f[0]
+        nb = sorted(x for fk, x in zip(f, p) if 2.0 <= fk <= 20.0)
+        return {"f": f, "psd": p, "fs": fs, "df": df, "det_rms": math.sqrt(15 * nb[len(nb) // 2] * df), "v": v}
+    fz = 500.03
+    mp = mkm(pulses(24.0, 200.0, fz, 47.0), 47.0)
+    a_th = math.sqrt(2) / math.pi * 24.0 * math.sin(math.pi * 200e-6 * fz)
+    a_me = peak_rms(mp, alias(fz, 47.0))
+    chk(abs(a_me / a_th - 1) < 0.05, "Pulsfolge 500 Hz @47 Hz: Grundwelle %.3f mV (Theorie %.3f)" % (a_me, a_th))
+    MM = {"I47": mkm([random.gauss(0, 0.5) for _ in range(int(180 * 47))], 47.0),
+          "C47": mkm(pulses(24.0, 40.0, 500.011, 47.0), 47.0), "C47x": mkm(pulses(24.0, 200.0, 500.011, 47.0), 47.0)}
+    # 500,011 statt 500,000: genau 500 Hz waere mit 47 Hz kommensurabel (nur 47 Phasenlagen) - kuenstlicher Testfehler
+    CC = {"C47": {"gen": {"cpu_us_je_aufruf": 40.0, "ist_hz": 500.011}}, "C47x": {"gen": {"cpu_us_je_aufruf": 200.0, "ist_hz": 500.011}}}
+    for hp, soll, nz in ((24.0, 1.0, 0.1), (48.0, 0.5, 0.1), (24.0, 1.0, 0.8), (48.0, 0.5, 0.8)):
+        # Abtastzeit-Streuung 0,1 ms wie beim echten Logger (sonst kuenstliche Phasenmuster bei fast kommensurablen Raten)
+        jt = lambda: random.gauss(0, 1e-4)
+        def pj(h, us, f):
+            d = us * 1e-6 * f
+            return [-(h if ((i / 47.0 + jt()) * f) % 1.0 < d else 0.0) + random.gauss(0, nz) for i in range(int(180 * 47))]
+        MM = {"I47": mkm([random.gauss(0, nz) for _ in range(int(180 * 47))], 47.0), "P47": mkm(pj(hp, 40.0, fz), 47.0),
+              "C47": mkm(pj(24.0, 40.0, 500.011), 47.0), "C47x": mkm(pj(24.0, 200.0, 500.011), 47.0)}
+        me = mechanism(MM, CC, {"diretta_us": 40.0, "end0_hz": fz})
+        q, qs = (me.get("ratio", float("nan")), me.get("ratio_se", float("nan"))) if me else (float("nan"),) * 2
+        lin = me["L1"]["a"] / me["pred1"] if me and me.get("pred1") else float("nan")
+        chk(abs(q - soll) <= max(0.06 * soll, 3 * qs) and math.isfinite(qs) and abs(lin - 1) < 0.25,
+            "Mechanismus synthetisch (Rauschen %.1f mV): Diretta-Puls %.0f mV -> Prozessoranteil %.2f +- %.2f (Soll %.2f), Linearitaet x%.2f" % (
+                nz, hp, q, qs, soll, lin))
+    pc = Pacer(500.0, cpu_burst(100), "t"); pc.start(); time.sleep(1.0); pc.stop_ev.set(); pc.join(); st = pc.stats()
+    chk(95 <= st["cpu_us_je_aufruf"] <= 300, "Pacer misst Rechenzeit je Aufruf: %.1f us (Schleife 100 us)" % st["cpu_us_je_aufruf"])
+    bu, got = tune_burst(150.0, 500.0)
+    chk(0.8 <= got / 150.0 <= 1.25, "Abgleich Rechenzeit: Soll 150 us -> gemessen %.1f us (Schleife %.1f us)" % (got, bu))
+    pl = Pacer(0.1, lambda: None, "lang"); pl.start(); time.sleep(0.3); t_ = time.monotonic(); pl.stop_ev.set(); pl.join(3)
+    chk(not pl.is_alive() and time.monotonic() - t_ < 1.0, "Pacer mit 10-s-Periode sofort abbrechbar")
+    dr = diretta_rt()
+    chk(isinstance(dr.get("ns"), int) and dr["ns"] >= 0, "Diretta-Rechenzeit lesbar (%s, %d Threads-Namen)" % (dr["quelle"], len(dr["threads"])))
     print("SELBSTTEST %s" % ("BESTANDEN" if ok else "NICHT BESTANDEN"))
     return 0 if ok else 1
 
@@ -974,11 +1381,12 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("run"); r.add_argument("--dur", type=int, default=180); r.add_argument("--ohne-musik", action="store_true")
     r.add_argument("--kal-kurz", action="store_true", help="nur 2 Kalibrierfrequenzen (7,3 / 213 Hz) statt 6")
+    w = sp.add_parser("widerstand"); w.add_argument("--dur", type=int, default=180)
     sp.add_parser("status"); sp.add_parser("stop"); sp.add_parser("selftest")
     a = sp.add_parser("analyse"); a.add_argument("ordner")
     v = sp.add_parser("vergleich"); v.add_argument("a"); v.add_argument("b")
     k = sp.add_parser("_child"); k.add_argument("dir"); k.add_argument("dur", type=int); k.add_argument("music", type=int)
-    k.add_argument("lockfd", type=int); k.add_argument("kal_kurz", type=int)
+    k.add_argument("lockfd", type=int); k.add_argument("kal_kurz", type=int); k.add_argument("mode")
     args = ap.parse_args()
     if args.cmd == "selftest":
         return selftest()
@@ -987,7 +1395,7 @@ def main():
     if args.cmd == "vergleich":
         print(compare(os.path.abspath(args.a), os.path.abspath(args.b)), end=""); return 0
     if args.cmd == "_child":
-        return child_main(args.dir, args.dur, bool(args.music), args.lockfd, bool(args.kal_kurz))
+        return child_main(args.dir, args.dur, bool(args.music), args.lockfd, bool(args.kal_kurz), args.mode)
     curp = os.path.join(SHM, "current.json")
     cur = H.rjson(curp) if os.path.isfile(curp) else None
     if args.cmd == "status":
@@ -999,6 +1407,9 @@ def main():
         if cur and H.alive(cur["pid"]):
             os.kill(cur["pid"], signal.SIGTERM); print("Abbruch gesendet."); return 0
         print("keine laufende Messung"); return 0
+    mode = "widerstand" if args.cmd == "widerstand" else "voll"
+    ohne = mode == "widerstand" or args.ohne_musik
+    kurz = mode == "voll" and args.kal_kurz
     if args.dur < 60:
         print("--dur mindestens 60 s (Spektralaufloesung)"); return 2
     os.makedirs(SHM, exist_ok=True)
@@ -1015,15 +1426,18 @@ def main():
     logp = os.path.join(cdir, "run.log")
     with open(logp, "w") as lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_child", cdir, str(args.dur),
-                              str(0 if args.ohne_musik else 1), str(lock.fileno()), str(int(args.kal_kurz))], stdin=subprocess.DEVNULL,
+                              str(0 if ohne else 1), str(lock.fileno()), str(int(kurz)), mode], stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
     lock.close()
     H.wjson(curp, {"dir": cdir, "pid": p.pid})
-    nk = 3 if args.kal_kurz else 7
-    n = 8 + (0 if args.ohne_musik else 2)
-    tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE
-    print("Versuchsreihe gestartet: %d Bedingungen + %d Kalibrierungen, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
-        n, nk, round(tot / 60)))
+    if mode == "widerstand":
+        n, nk, tot = 1, 0, args.dur + 30
+    else:
+        nk = 3 if kurz else 7
+        n = 9 + (0 if ohne else 4)          # I50 I47 E50 E47 U50 C50 I50m R50 I50b (+ P50 P47 C47 C47x)
+        tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE + (0 if ohne else 6)
+    print("%s gestartet: %d Bedingungen + %d Kalibrierungen, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
+        "Widerstandsmessung" if mode == "widerstand" else "Versuchsreihe", n, nk, round(tot / 60)))
     print("Fortschritt:  python3 vschwank.py status      Abbruch:  python3 vschwank.py stop\n")
     pos = 0
     try:
