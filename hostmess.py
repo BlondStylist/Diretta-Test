@@ -506,7 +506,7 @@ def campaign_main(cdir, args):
         c.preflight(); c.meta()
         if args.idle: c.phase("idle", args.idle, False)
         if args.play: c.phase("play", args.play, True)
-        if args.step: c.phase("step", args.step, False, step=True)
+        if args.step: c.phase("step", args.step, bool(args.step_music), step=True)
         done = True
     except SystemExit as e:
         log("== ABBRUCH: %s" % e); rc = 1
@@ -813,7 +813,7 @@ def analyse(cdir, write_files=False):
         act = analyse_activity(xa, xb, dt, L, mine={m.get("pid"), info.get("logger_pid")})
         cor = analyse_correlation(rows, volt, L, excl)
         # Kurzbericht
-        S.append(""); S.append("[%s] V: %s" % (name, vline))
+        S.append(""); S.append("[%s%s] V: %s" % (name, " mit Musik" if name == "step" and info["want_play"] else "", vline))
         S.append("  CPU-busy %%: %s | Kontextw. %.0f/s  IRQ %.0f/s  neue Prozesse %d (%s)" % (
             " ".join("%s=%.2f" % (k[3:], v) for k, v in sorted(act["busy"].items())), act["ctxt"], act["intr"],
             act["forks"], src))
@@ -929,10 +929,12 @@ def main():
     r = sp.add_parser("run")
     r.add_argument("--idle", type=int, default=600); r.add_argument("--play", type=int, default=600)
     r.add_argument("--step", type=int, default=300)
+    r.add_argument("--step-mit-musik", action="store_true", help="Laststufen bei laufender Musik (unbeaufsichtigt)")
     sp.add_parser("status"); sp.add_parser("stop"); sp.add_parser("selftest")
     a = sp.add_parser("analyse"); a.add_argument("ordner")
     k = sp.add_parser("_child"); k.add_argument("dir"); k.add_argument("idle", type=int)
     k.add_argument("play", type=int); k.add_argument("step", type=int); k.add_argument("lockfd", type=int)
+    k.add_argument("step_music", type=int)
     args = ap.parse_args()
 
     if args.cmd == "selftest":
@@ -974,7 +976,7 @@ def main():
     logp = os.path.join(cdir, "run.log")
     with open(logp, "w") as lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_child", cdir, str(args.idle),
-                              str(args.play), str(args.step), str(lock.fileno())], stdin=subprocess.DEVNULL,
+                              str(args.play), str(args.step), str(lock.fileno()), str(int(args.step_mit_musik))], stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
     lock.close()   # Sperre lebt im Kind weiter (gleiche offene Datei)
     wjson(os.path.join(SHM, "current.json"), {"dir": cdir, "pid": p.pid})
