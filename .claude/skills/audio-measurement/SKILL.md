@@ -11,6 +11,8 @@ Grundsaetze (verbindlich):
 - **Messwerkzeug-Eigenlast ausweisen**; Werkzeuge auf CPU0/1, nie unbemerkt auf den Audio-Kernen 2/3.
 - **Unterschiede nur deuten, wenn groesser als der Standardfehler**; Korrelation ist kein Ursachennachweis.
 - Waehrend Messfenstern nicht auf die SD-Karte schreiben (Repo-Werkzeuge nutzen `/dev/shm`).
+- **Lastgeneratoren, die auf derselben CPU wie ihre Steuerung laufen, mit `chrt -i 0` (SCHED_IDLE) starten** - sonst verzoegert
+  die Last ihr eigenes Abschalten (gemessen: Tastverhaeltnis 70 % statt 50 % bei 113 Hz) und verfaelscht Kalibrierungen.
 
 ## 1. Repo-Werkzeuge (bevorzugt, getestet)
 
