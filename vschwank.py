@@ -176,16 +176,19 @@ def fit_window(pts):
         return None
     return best[0], best[1], math.sqrt(best[2] / len(pts)) / best[1]
 
-def kal_fit(M):
+def kal_fit(M, C=None):
     """Kalibrierpunkte (Tag, f, Alias, rms, xRuhe, signifikant) und Fensterfit."""
     krow, kpts = [], []
     for fk in KAL_F:
         t = ktag(fk)
         if t in M and "f" in M[t]:
             fa = alias(fk, M[t]["fs"]); a = peak_rms(M[t], fa)
+            d = (C.get(t, {}).get("gen") or {}).get("tastverhaeltnis", float("nan")) if C else float("nan")
+            if math.isfinite(d) and 0.1 < d < 0.9:
+                a = a / math.sin(math.pi * d)      # Grundwelle eines Rechtecks ~ sin(pi*d); auf 50 % normiert
             rr, _ = excess(M[t], M.get("I50"), fa, 0.15)
             ok = rr >= 4 and math.isfinite(a)
-            krow.append((t, fk, fa, a, rr, ok))
+            krow.append((t, fk, fa, a, rr, ok, d))
             if ok:
                 kpts.append((fk, a))
     return krow, (fit_window(kpts) if len(kpts) >= 3 else None)
@@ -267,12 +270,20 @@ class SquareGen(threading.Thread):
     def _toggle(self):
         os.kill(self.proc.pid, signal.SIGSTOP if self.on else signal.SIGCONT); self.on = not self.on
 
+    def _cpu(self):
+        st = H.parse_task_stat(H.rd("/proc/%d/stat" % self.proc.pid))
+        return (st["utime"] + st["stime"]) / H.TICK if st else float("nan")
+
     def run(self):
-        self.proc = subprocess.Popen(["taskset", "-c", str(H.CTL_CPU), "sha256sum", "/dev/zero"],
+        # SCHED_IDLE: der Taktgeber (normale Prioritaet, gleiche CPU) verdraengt die Last sofort -> sauberes 50-%-Rechteck
+        self.proc = subprocess.Popen(["taskset", "-c", str(H.CTL_CPU), "chrt", "-i", "0", "sha256sum", "/dev/zero"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+        c0, w0 = self._cpu(), time.monotonic()
         self.pacer = Pacer(2 * self.freq, self._toggle, self.label); self.pacer.start()
         self.stop_ev.wait()
         self.pacer.stop_ev.set(); self.pacer.join(5)
+        self.duty = (self._cpu() - c0) / (time.monotonic() - w0)   # gemessener Anteil "Last an" (Rechenzeit / Wandzeit)
         try:
             os.kill(self.proc.pid, signal.SIGCONT); self.proc.terminate(); self.proc.wait(5)
         except (OSError, subprocess.TimeoutExpired):
@@ -283,6 +294,7 @@ class SquareGen(threading.Thread):
                                                     "fehler": 0, "verzug_p50_ms": float("nan"), "verzug_p99_ms": float("nan"),
                                                     "verzug_max_ms": float("nan")}
         st["rechteck_hz"] = self.freq
+        st["tastverhaeltnis"] = getattr(self, "duty", float("nan"))
         return st
 
 def udp_sender(dst, size):
@@ -511,6 +523,9 @@ def preflight():
             errs.append("fehlt: " + os.path.join(H.EXT5V, f))
     if H.other_logger_running():
         errs.append("ext5v_log laeuft bereits")
+    for c in ("taskset", "chrt", "sha256sum"):
+        if not shutil.which(c):
+            errs.append("Befehl fehlt: " + c)
     hl = os.path.join(H.SHM, "lock")
     if os.path.exists(hl):
         try:
@@ -760,7 +775,7 @@ def analyse(cdir):
     if params:
         for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
             ivs = source_search(M, f0)
-            fit_ = kal_fit(M)[1]
+            fit_ = kal_fit(M, C)[1]
             def corr(fq, rms):
                 if not fit_:
                     return ""
@@ -788,15 +803,15 @@ def analyse(cdir):
                     lab, ex, uex, 100 * ex / (vp - vi), 100 * uex / (vp - vi), "  (E50 - C50)" if minus else "")
                 L.append(line); S.append(line)
     # Kalibrierung 1: Frequenzgang der Messkette (identische Rechtecklast, verschiedene Frequenzen)
-    krow, fit = kal_fit(M)
+    krow, fit = kal_fit(M, C)
     if krow:
         L.append(""); S.append("")
-        hd = "Kalibrierung 1 - Frequenzgang Messkette (Rechtecklast CPU0, Grundwellen-rms am Alias):"
+        hd = "Kalibrierung 1 - Frequenzgang Messkette (Rechtecklast CPU0, Grundwellen-rms am Alias, auf 50 % Tastverhaeltnis korrigiert):"
         L.append(hd); S.append(hd)
         a_ref = fit[1] if fit else (krow[0][3] if krow else float("nan"))
-        for t, fk, fa, a, rr, ok in krow:
-            line = "  %-5s %6.1f Hz -> Alias %5.2f Hz  rms %s mV  x%s ggue. Ruhe  H=%s%s" % (
-                t, fk, fa, fmt(a), fmt(rr, 0), fmt(a / a_ref if a_ref > 0 else float("nan")),
+        for t, fk, fa, a, rr, ok, d in krow:
+            line = "  %-5s %6.1f Hz -> Alias %5.2f Hz  rms %s mV (Tastv. %s %%)  x%s ggue. Ruhe  H=%s%s" % (
+                t, fk, fa, fmt(a), fmt(100 * d, 0), fmt(rr, 0), fmt(a / a_ref if a_ref > 0 else float("nan")),
                 "" if ok else "  (nicht signifikant, nicht im Fit)")
             L.append(line); S.append(line)
         if "K213b" in M and "f" in M["K213b"]:
@@ -833,12 +848,16 @@ def analyse(cdir):
             for b, how in [baseline(M, C, (C[t]["c0"]["t"] + C[t]["c1"]["t"]) / 2)]) + "  (* = nicht interpoliert)"
         L.append(line); S.append(line)
     if all(t in M and "mean" in M[t] for t in ("I50", "I50b")):
-        if "I50m" in M and "mean" in M["I50m"]:
-            mm = [M[t]["mean"] for t in IDLE_REF]
-            checks.append(("Ruhe-Referenzen konsistent (Spanne %.2f mV <= 3 mV)" % (max(mm) - min(mm)), max(mm) - min(mm) <= 3.0))
+        tm = lambda t: (C[t]["c0"]["t"] + C[t]["c1"]["t"]) / 2
         dmean = M["I50b"]["mean"] - M["I50"]["mean"]
+        rate = 60.0 * dmean / (tm("I50b") - tm("I50")) if tm("I50b") > tm("I50") else float("nan")
+        if "I50m" in M and "mean" in M["I50m"]:
+            lin = M["I50"]["mean"] + dmean * (tm("I50m") - tm("I50")) / (tm("I50b") - tm("I50"))
+            dev = M["I50m"]["mean"] - lin
+            checks.append(("Drift gleichmaessig -> Korrektur gueltig (Drift %+.3f mV/min, I50m weicht %+.2f mV von der Geraden ab, <= 1,5 mV)" % (
+                rate, dev), abs(dev) <= 1.5))
         rv = M["I50b"]["var_hf"] / M["I50"]["var_hf"] if M["I50"]["var_hf"] > 0 else float("nan")
-        checks.append(("Ruhe stabil: I50b-I50 Mittel %+.2f mV, Varianz x%.2f" % (dmean, rv), abs(dmean) <= 3.0 and 0.75 <= rv <= 1.33))
+        checks.append(("Ruhe-Schwankung reproduzierbar (Varianz I50b/I50 x%.2f, 0,75..1,33)" % rv, 0.75 <= rv <= 1.33))
     # Aktivitaet (Vollbericht)
     L.append(""); L.append("Aktivitaet je Bedingung:")
     for t in TAGS:
@@ -937,8 +956,10 @@ def selftest():
     for _ in range(20):
         st_ = H.rd("/proc/%d/stat" % sg.proc.pid).split(") ")[-1][:1]; states.add(st_); time.sleep(0.023)
     sg.stop_ev.set(); sg.join(10); gs = sg.stats()
-    chk({"T"} <= states and (states & {"R", "S"}) and abs(gs["ist_hz"] - 10) < 1 and sg.proc.poll() is not None,
-        "Rechtecklast 5 Hz: Zustaende %s, Umschaltrate %.1f/s, beendet" % (sorted(states), gs["ist_hz"]))
+    chk({"T"} <= states and (states & {"R", "S"}) and abs(gs["ist_hz"] - 10) < 1 and sg.proc.poll() is not None
+        and 0.42 <= gs["tastverhaeltnis"] <= 0.58,
+        "Rechtecklast 5 Hz: Zustaende %s, Umschaltrate %.1f/s, Tastverhaeltnis %.2f, beendet" % (
+            sorted(states), gs["ist_hz"], gs["tastverhaeltnis"]))
     cnt = []
     pc = Pacer(500.0, lambda: cnt.append(1), "t"); pc.start(); time.sleep(1.0); pc.stop_ev.set(); pc.join()
     st = pc.stats()
