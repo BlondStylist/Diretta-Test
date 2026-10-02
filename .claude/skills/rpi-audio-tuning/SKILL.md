@@ -21,7 +21,7 @@ Gemessener Stand 30.09./02.10.2026 (Host `diretta-host`, Pi 5 Rev 1.1):
 - Diretta Host `setting.inf`: `ThredMode=17 CycleTime=2000 FlexCycle=enable InfoCycle=200000 CpuSend=2 CpuOther=3`
 - `end0` 10 Mbit/s (Super Purist, absichtlich), EEE aus, Coalescing 0 (`end0-coalesce-zero.service`), MTU 9000
 Target `diretta-target`: Core 2 = Audiothread + USB-IRQ 134, Core 3 = Netz-IRQ 104, Core 0/1 = Rest,
-`ThredMode=16 CycleTime=2000 InfoCycle=200000 CpuSend=2 CpuOther=3`.
+Target hat **keine** CycleTime-Einstellung (geprueft 02.10.2026: kein Treffer unter /opt, /etc); den Takt legt der Host fest.
 
 ## 2. Stellschrauben (Befehle, alle umkehrbar)
 
@@ -55,6 +55,9 @@ Audio-Kerne, erzeugt aber Weckvorgaenge auf CPU0/1 - gemessen `rcuog/2` ~460/s).
 9. **`syncAlsa` (Diretta) laeuft auch ohne Musik** (100/s auf CPU3), bei Wiedergabe ~500/s je Audio-Kern; `irq/104-eth` ~980/s auf CPU2.
 10. **Host-Netzteil darf nicht geteilt werden** (Tomanek speiste frueher zusaetzlich den OptiLink).
 11. **`config.txt`/`cmdline.txt` wirken erst nach Reboot**, vorher Sicherung (`cp /boot/config.txt /boot/config.txt.vor-<thema>`).
+13. **`CycleTime` am Host allein wirkt nicht bei `FlexCycle=enable`:** 4000 gesetzt + Neustart -> weiter 500 Pak/s, 1555 B/Paket
+    (96/32, gemessen 02.10.2026). Wieder auf 2000 zurueckgesetzt. `isolated_app.sh` schreibt bei jedem Diretta-Start Unit-Dateien um
+    (daher Warnung „unit file changed on disk“) - kein `daemon-reload` mitten in einer Messreihe.
 12. Kamera-Erkennung ist am Host aus, Display-Erkennung und `avahi-daemon` bewusst an (.local-Namen werden genutzt), `serial-getty@ttyAMA10` maskiert.
 
 ## 4. Vorgehen bei jeder Aenderung

@@ -51,6 +51,7 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 | 30.09.2026 | Host | `serial-getty@ttyAMA10.service` maskiert (serielle Anmeldung an GPIO aus) | `sudo systemctl unmask serial-getty@ttyAMA10.service && sudo systemctl start serial-getty@ttyAMA10.service` |
 | 30.09.2026 | Host | Bewusst **nicht** geändert: `display_auto_detect`, `avahi-daemon` (.local-Namen werden genutzt) | – |
 | 30.09.2026 | Netzteile | Tomanek nur noch Host; OptiLink an altes Target-NT (5,11 V) | umstecken |
+| 02.10.2026 | Host | Test `CycleTime=2000`→`4000` (FlexCycle=enable): ohne Wirkung (weiter 500 Pak/s, 1555 B) → **zurückgesetzt** aus `/opt/diretta-alsa/setting.inf.vor-cycle4000` | – |
 
 ## NUC8i7BEH (Roon ROCK) – Bestandsaufnahme 30.09.2026
 
