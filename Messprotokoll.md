@@ -76,3 +76,30 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 Laststufe CPU0 (sha256sum, 10 s an/aus, 14 Zyklen, bei Wiedergabe): Absenkung **25,2 mV** je voll belastetem Kern, Unterschwinger beim Einschalten zusaetzlich −11,7 mV, Ueberschwinger 2,4 mV, Flankenverzug ~0 ms (Zeitausrichtung bestaetigt). Korrelation Sekundenmittel V zu CPU0-Last r = −1,00.
 
 Bewertung: System sehr ruhig (3 neue Prozesse/10 min, ~1 SD-Schreibvorgang/min). Wiedergabe verdoppelt die Spannungsschwankung (2,07 → 4,36 mV) ohne messbare CPU-Lastkorrelation je Sekunde → Ursache im Sub-Sekunden-Bereich (Netz-/USB-Aktivitaet). Kandidat fuer Test: USB-Netzwerkadapter ASIX AX88179B laeuft am USB-3-Port (5 Gbit/s) → Test am USB-2-Port.
+
+## Ursachenanalyse Spannungsschwankung (vschwank.py 1.2, Host, 02.10.2026 20:53, 138/138 Pruefungen bestanden)
+
+Kalibrierung: Frequenzgang H = 0,97-1,01 von 3,1 bis 313 Hz (K213b @47 Hz: 1,00), Sensorfenster T = 0,00 ms (Rest 1 %)
+-> Sensor tastet momentan ab, 500-Hz-Effekte werden ungedaempft erfasst. Lastempfindlichkeit 24,3 mV/Kern (hostmess: 25,2).
+Nachweisgrenze Spitzen: P50 1,18 mV, I50 0,52 mV. Drift: I50 4965,266 / I50m 4965,239 / I50b 4965,498 mV (~38 °C) - vernachlaessigbar.
+
+| Bedingung | sd mV | Varianz >0,1 Hz mV² | Mittel rel. Ruhe mV |
+|---|---|---|---|
+| I50 Ruhe @50 | 2,23 | 4,86 | 0 |
+| I47 Ruhe @47 | 2,48 | 6,13 | – |
+| P50 Musik @50 | 4,93 | 24,11 | −5,45 |
+| P47 Musik @47 | 6,68 | 44,19 | −4,67 |
+| E50 end0-Nachbildung @50 | 4,81 | 18,87 | −3,67 |
+| E47 end0-Nachbildung @47 | 5,01 | 24,93 | −3,80 |
+| U50 USB-Netz TX @50 | 3,83 | 14,41 | −0,47 |
+| C50 CPU-Wecker 500/s @50 | 4,72 | 21,76 | −1,00 |
+
+Befunde:
+- Diretta-Zyklus bestaetigt: end0 500,0 Pak/s × 1389 B (Zyklus 500,03 Hz). P47-Spitzen 16,98 Hz (= 500 Hz, 1,80 mV eff.) und
+  13,04 Hz (= 1000 Hz), dazu 21,02/22,03 Hz. Quellsuche 499,93-500,10 Hz: 1,80 mV eff. (korrigiert 1,80, H = 1).
+- E47 (kuenstlicher end0-Verkehr gleicher Rate/Groesse, ohne Musik) erzeugt dieselben Spitzen (16,98/13,04/22,21/20,84 Hz)
+  -> der 500-Hz-Netzwerkzyklus selbst ist eine Hauptquelle. E47−I47 = 18,80 mV² ≈ 49 % von P47−I47 = 38,06 mV².
+- 50/60/100/120/150 Hz: nicht vorhanden (Markierungen nur in P47, fallen exakt auf Diretta-Oberwellen-Aliase; P50 bei 10/20 Hz ohne Spitze).
+- Einschraenkung: E50/C50 bei 500,04 Hz falten bei 50-Hz-Abtastung auf 0,04 Hz -> Schwebung im Band 0,1-0,5 Hz
+  (2,78/3,49 mV gegen 0,33 mV Ruhe) blaeht deren Anteile auf (end0 73±19 %, CPU 88±43 %). Aussagekraeftig ist der 47-Hz-Vergleich.
+- enu1 (305,6 Pak/s): keine Spitze; USB-Sendelast als Ersatz ~50±3 % Varianzanteil (breitbandig, keine Linie).
