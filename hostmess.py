@@ -388,7 +388,7 @@ class Campaign:
     def wait_state(self, want_play):
         txt = "Musik STARTEN (wie gewohnt, 48 oder 96 kHz)" if want_play else "Musik STOPPEN"
         t_end = time.monotonic() + WAIT_MAX
-        announced = False
+        announced = 0
         while True:
             if alsa_state()[0] == want_play:
                 # Zustand muss die ganze Beruhigungszeit stabil bleiben
@@ -402,9 +402,10 @@ class Campaign:
                 if stable:
                     return
                 log("Zustand hat gewechselt - warte erneut")
-            if not announced:
-                log(">>> BITTE JETZT: %s  (Messung startet automatisch)" % txt)
-                announced = True
+            if not announced or time.monotonic() - announced >= 120:   # Erinnerung alle 2 min
+                log(">>> BITTE JETZT: %s  (Messung startet automatisch; Abbruch in %d min)" % (
+                    txt, max(0, round((t_end - time.monotonic()) / 60))))
+                announced = time.monotonic()
             if time.monotonic() > t_end:
                 raise SystemExit("Zeitueberschreitung beim Warten auf: %s" % txt)
             time.sleep(1.0)
