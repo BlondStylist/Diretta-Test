@@ -17,6 +17,9 @@ ADC-Auflösung 1,34 mV, Absolutfehler ca. ±1,5 % (Vergleiche zwischen Läufen a
 | 30.09. | Host | Tomanek, geteilt mit OptiLink | tom-shared-play | 300 s | 4,96240 | 4,49 | 4,90842 | 4,96872 | 4,88966 | 4,96872 | 0x0 |
 | 30.09. | Host | Tomanek allein (OptiLink jetzt am alten Target-NT, 5,11 V, über passiven Barrel→USB-C-Adapter) | tom-solo-idle | 300 s | 4,96709 | 2,05 | 4,95264 | 4,97140 | 4,92986 | 4,97140 | 0x0 |
 | 30.09. | Host | wie oben | tom-solo-play | 300 s | 4,96173 | 4,24 | 4,91110 | 4,96470 | 4,89636 | 4,96604 | 0x0 |
+| 02.10. | Host | Tomanek allein, hostmess.py | hm-idle | 600 s | 4,96986 | 2,07 | – | – | 4,92986 | 4,97408 | 0x0 |
+| 02.10. | Host | wie oben, Wiedergabe 96 kHz/32 Bit | hm-play | 600 s | 4,96203 | 4,36 | 4,90842 | 4,96872 | 4,88698 | 4,97006 | 0x0 |
+| 02.10. | Host | wie oben, Laststufen CPU0 bei Wiedergabe | hm-step | 300 s | 4,95483 | 13,29 | 4,90842 | 4,97140 | 4,88698 | 4,97140 | 0x0 |
 
 ¹ Merker vom Kaltstart (Einschaltstrom der USB-Kette bei ~6 s), kein Einbruch im Betrieb.
 
@@ -56,3 +59,20 @@ Einzelwert `diagnose.sh` Host 30.09. 15:08: 4,907 V (Momentwert, nicht repräsen
 - Netzteil: Keces P8 **Doppelausgang** (9/12 V + 18/19 V, je 4 A, Überstromabschaltung 4,2 A, gemeinsamer Ringkerntrafo, getrennte Masse je Schiene). Schiene 19 V → NUC (max. ~80 W, NUC-Spitze ca. 60–65 W → Reserve, mit Turbo aus deutlich mehr); Schiene 12 V → FritzBox 7590 (Bedarf ca. 10–15 W, Original-NT 12 V/2,5 A). OLED-Anzeige zeigt Spannung und Strom.
 - Passives, lüfterloses Gehäuse. Angeschlossen nur LAN + DC.
 - BIOS noch nicht geändert. Geplant (Werte vorher notieren): WLAN, Bluetooth, HD Audio, Mikrofon, Card Reader, Consumer IR, ggf. Thunderbolt aus; Turbo Boost aus; LEDs aus; After Power Failure = Last State/Power On; C-States/SpeedStep/Hyper-Threading unverändert; CPU-Temperatur vorher/nachher ablesen.
+
+## Host-Aktivitaet (hostmess.py, 02.10.2026, im Messfenster)
+
+| Groesse | Ruhe | Wiedergabe 96/32 |
+|---|---|---|
+| CPU-busy CPU0/1/2/3 [%] | 0,07 / 0,04 / 0,00 / 0,02 | 0,47 / 0,33 / 1,01 / 0,21 |
+| Kontextwechsel/s | 3561 | 8445 |
+| Interrupts/s | 3181 | 6210 |
+| neue Prozesse in 600 s | 3 | 3 |
+| SD-Schreibvorgaenge/s | 0,018 | 0,017 |
+| Netz end0 / enu1 [Pak/s] | 0,9 / 7,4 | 505 / 361 |
+| CPU2/3 haeufigste Wecker | syncAlsa 100/s (cpu3) | irq/104-eth 978/s (cpu2), syncAlsa 510/s (cpu2) + 500/s (cpu3) |
+| CPU0/1 haeufigste Wecker | rcuog/2 468/s, ktimers/1 344/s, ktimers/0 257/s, ksoftirqd/0+1 je ~250/s | rcuog/2 459/s, RAATServer 375/s |
+
+Laststufe CPU0 (sha256sum, 10 s an/aus, 14 Zyklen, bei Wiedergabe): Absenkung **25,2 mV** je voll belastetem Kern, Unterschwinger beim Einschalten zusaetzlich −11,7 mV, Ueberschwinger 2,4 mV, Flankenverzug ~0 ms (Zeitausrichtung bestaetigt). Korrelation Sekundenmittel V zu CPU0-Last r = −1,00.
+
+Bewertung: System sehr ruhig (3 neue Prozesse/10 min, ~1 SD-Schreibvorgang/min). Wiedergabe verdoppelt die Spannungsschwankung (2,07 → 4,36 mV) ohne messbare CPU-Lastkorrelation je Sekunde → Ursache im Sub-Sekunden-Bereich (Netz-/USB-Aktivitaet). Kandidat fuer Test: USB-Netzwerkadapter ASIX AX88179B laeuft am USB-3-Port (5 Gbit/s) → Test am USB-2-Port.
