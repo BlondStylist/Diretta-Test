@@ -32,11 +32,12 @@ END0 = os.environ.get("VS_END0", "end0")
 LAN = os.environ.get("VS_LAN", "enu1")
 END0_DST = os.environ.get("VS_END0_DST", "172.20.0.2")       # Target (Diretta-Gegenstelle)
 LAN_DST = os.environ.get("VS_LAN_DST", "192.168.178.1")      # Router
-SETTLE_CHANGE = float(os.environ.get("VS_SETTLE", "30"))     # nach Musik an/aus
+SETTLE_CHANGE = float(os.environ.get("VS_SETTLE", "60"))     # nach Musik an/aus (auch thermisch)
 SETTLE_SAME = float(os.environ.get("VS_SETTLE_SAME", "15"))  # zwischen Bedingungen gleichen Zustands
 WAIT_MAX = float(os.environ.get("VS_WAIT", "1800"))
 NSEG = 512                                                   # Welch-Segment (Potenz von 2)
-BANDS = ((0.02, 0.2), (0.2, 2.0), (2.0, 10.0), (10.0, 1e9))
+BANDS = ((0.09, 0.5), (0.5, 2.0), (2.0, 10.0), (10.0, 1e9))   # unterstes Band ab 1. Bin (0,098 Hz)
+VAR_FMIN = 0.09                                                 # Varianzanteile ohne Drift (< 0,1 Hz)
 log = H.log
 
 
@@ -163,8 +164,8 @@ class Pacer(threading.Thread):
                 self.err += 1
             self.n += 1
             nxt += per
-            if time.monotonic() - nxt > 0.5:      # Ueberlast: Takt neu aufsetzen statt nachzuholen
-                nxt = time.monotonic()
+            if time.monotonic() - nxt > 3 * per:  # mehr als 3 Perioden zurueck: Takt neu aufsetzen, nicht buendeln
+                nxt = time.monotonic(); self.resync = getattr(self, "resync", 0) + 1
         self.t1 = H.now_boot()
 
     def stats(self):
@@ -172,7 +173,8 @@ class Pacer(threading.Thread):
         s = sorted(self.late)
         return {"label": self.label, "soll_hz": self.rate, "ist_hz": self.n / dt if dt > 0 else 0.0, "n": self.n,
                 "fehler": self.err, "verzug_p50_ms": 1000 * pct(s, 50), "verzug_p99_ms": 1000 * pct(s, 99),
-                "verzug_max_ms": 1000 * (s[-1] if s else float("nan"))}
+                "verzug_max_ms": 1000 * (s[-1] if s else float("nan")), "neu_aufgesetzt": getattr(self, "resync", 0),
+                "anteil_ueber_1ms": 100.0 * sum(1 for x in s if x > 1e-3) / len(s) if s else float("nan")}
 
 def udp_sender(dst, size):
     sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -277,15 +279,17 @@ class Series:
             v = H.rd("/sys/class/net/%s/mtu" % i).strip()
             return int(v) if v.isdigit() else 1500
         e, l = nr.get(END0, {}), nr.get(LAN, {})
-        p = {"quelle": "gemessen (P50)" if e.get("txp", 0) > 50 else "Standardwerte (keine Wiedergabe gemessen)"}
-        p["end0_hz"] = e["txp"] if e.get("txp", 0) > 50 else 500.0
+        p = {"quelle_end0": "gemessen (P50)" if e.get("txp", 0) > 50 else "Standardwert 505 (Messprotokoll 02.10.)",
+             "quelle_lan": "gemessen RX (P50), nachgebildet als TX" if l.get("rxp", 0) > 50 else "Standardwert 361, als TX"}
+        p["quelle"] = p["quelle_end0"] + " / " + p["quelle_lan"]
+        p["end0_hz"] = e["txp"] if e.get("txp", 0) > 50 else 505.0
         eb = e["txb"] / e["txp"] if e.get("txp", 0) > 50 else 1514.0
-        p["lan_hz"] = l["rxp"] if l.get("rxp", 0) > 50 else 360.0
+        p["lan_hz"] = l["rxp"] if l.get("rxp", 0) > 50 else 361.0
         lb = l["rxb"] / l["rxp"] if l.get("rxp", 0) > 50 else 1514.0
         # /proc/net/dev zaehlt Ethernet-Rahmen ohne FCS: Nutzlast = Rahmen - 14 (Eth) - 20 (IPv4) - 8 (UDP)
         p["end0_payload"] = int(max(18, min(eb - 42, mtu(END0) - 28)))
         p["lan_payload"] = int(max(18, min(lb - 42, mtu(LAN) - 28)))
-        p["cpu_hz"] = p["end0_hz"]; p["lan_if"] = LAN
+        p["cpu_hz"] = p["end0_hz"]; p["lan_if"] = LAN; p["end0_if"] = END0
         self.params = p
         H.wjson(os.path.join(self.dir, "params.json"), p)
         log("Nachbildung: end0 %.1f Pak/s x %d B, %s %.1f Pak/s x %d B, CPU-Wecker %.1f Hz (%s)" % (
@@ -307,6 +311,7 @@ class Series:
         self.condition("I50b", 50, False)
 
     def cleanup(self):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # zweites stop darf das Aufraeumen nicht unterbrechen
         if self.gen:
             self.gen.stop_ev.set(); self.gen.join(5)
         for p in list(self.children):
@@ -350,14 +355,16 @@ def child_main(cdir, dur, music, lockfd):
         log("== Messungen %s - Musik darf wieder laufen. Auswertung ..." % ("fertig" if done else "TEILWEISE"))
         dst = os.path.join(RESULTS, "vschwank_" + os.path.basename(cdir) + ("" if done else "_ABGEBROCHEN"))
         shutil.copytree(cdir, dst, ignore=shutil.ignore_patterns("run.log"))
-        full, short = analyse(dst)
-        for fn, txt in (("report.txt", full), ("kurz.txt", short)):
-            with open(os.path.join(dst, fn), "w") as f:
-                f.write(txt)
-        print(short, flush=True)
-        log("== %s  Ergebnis: %s" % ("FERTIG" if done else "TEILERGEBNIS GESPEICHERT", dst))
-        log("Kurzbericht: cat %s/kurz.txt" % dst)
-        write_sums(cdir, dst)
+        try:
+            full, short = analyse(dst)
+            for fn, txt in (("report.txt", full), ("kurz.txt", short)):
+                with open(os.path.join(dst, fn), "w") as f:
+                    f.write(txt)
+            print(short, flush=True)
+            log("== %s  Ergebnis: %s" % ("FERTIG" if done else "TEILERGEBNIS GESPEICHERT", dst))
+            log("Kurzbericht: cat %s/kurz.txt" % dst)
+        finally:
+            write_sums(cdir, dst)
     except Exception:
         log("== FEHLER bei der Auswertung (Rohdaten in %s)\n%s" % (cdir, traceback.format_exc())); rc = rc or 2
     return rc
@@ -385,6 +392,13 @@ def preflight():
             errs.append("fehlt: " + os.path.join(H.EXT5V, f))
     if H.other_logger_running():
         errs.append("ext5v_log laeuft bereits")
+    hl = os.path.join(H.SHM, "lock")
+    if os.path.exists(hl):
+        try:
+            with open(hl, "a") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            errs.append("hostmess.py-Messung laeuft gerade")
     if not glob.glob(H.ALSA_GLOB):
         errs.append("kein ALSA-Wiedergabegeraet")
     nd = H.parse_netdev(H.rd("/proc/net/dev"))
@@ -405,30 +419,41 @@ def preflight():
 
 
 # ------------------------------------------------------------------ Auswertung
+TAGS = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "I50b"]
+
 def load_cond(cdir, tag):
+    """Bedingung laden; None wenn nicht vorhanden. Defekte Dateien -> {'defekt': Grund}."""
     pth = os.path.join(cdir, tag, "cond.json")
     if not os.path.isfile(pth):
         return None
-    info = H.rjson(pth)
-    rdir = os.path.join(cdir, info["run_dir"]) if info.get("run_dir") else None
-    volt = H.load_voltage(rdir, 0.0) if rdir else []
+    try:
+        info = H.rjson(pth)
+        rdir = os.path.join(cdir, info["run_dir"]) if info.get("run_dir") else None
+        volt = H.load_voltage(rdir, 0.0) if rdir else []
+        smp = H.rjson(os.path.join(cdir, tag, "sampler.json"))["rows"]
+    except (OSError, KeyError, ValueError) as e:
+        return {"tag": tag, "defekt": str(e)}
     t = [a for a, _ in volt]; v = [b * 1000.0 for _, b in volt]          # mV
     fs = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else float("nan")
-    smp = H.rjson(os.path.join(cdir, tag, "sampler.json"))["rows"]
+    dts = [b - a for a, b in zip(t, t[1:])]
     al = [r["alsa"] for r in smp]
-    info.update({"v": v, "fs": fs, "alsa_frac": 100.0 * sum(al) / len(al) if al else float("nan"),
+    info.update({"v": v, "fs": fs, "dt_max": max(dts) if dts else float("nan"),
+                 "dt_gaps": sum(1 for d in dts if d > 1.5 / info["hz"]),
+                 "alsa_frac": 100.0 * sum(al) / len(al) if al else float("nan"),
                  "rates": sorted({r["rate"] for r in smp if r.get("rate")})})
     return info
 
 def metrics(c):
     v = c["v"]; s = sorted(v)
     m = {"n": len(v), "fs": c["fs"]}
-    if len(v) < 2:
+    if len(v) < 2 or not math.isfinite(c["fs"]):
         return m
     m.update({"mean": H.mean(v), "sd": H.sdev(v), "p01": pct(s, 0.1), "p999": pct(s, 99.9), "min": s[0], "max": s[-1]})
     f, p = welch(v, c["fs"])
     m["f"], m["psd"] = f, p
+    m["df"] = f[1] - f[0] if len(f) > 1 else float("nan")
     m["bands"] = [band_rms(f, p, lo, hi) for lo, hi in BANDS]
+    m["var_hf"] = band_rms(f, p, VAR_FMIN, 1e9) ** 2 if f else float("nan")   # Varianz ohne Drift < 0,1 Hz [mV^2]
     m["peaks"] = peaks(f, p)
     m["adev"] = adev(v, c["fs"])
     a, b = c["c0"], c["c1"]; dt = b["t"] - a["t"]
@@ -436,7 +461,7 @@ def metrics(c):
     m["busy"] = {k: 100.0 * (H.cpu_busy(sb["cpus"][k]) - H.cpu_busy(sa["cpus"][k])) /
                  max(1, H.cpu_total(sb["cpus"][k]) - H.cpu_total(sa["cpus"][k])) for k in sorted(sb["cpus"]) if k in sa["cpus"]}
     m["ctxt"] = (sb.get("ctxt", 0) - sa.get("ctxt", 0)) / dt; m["intr"] = (sb.get("intr", 0) - sa.get("intr", 0)) / dt
-    m["net"] = net_rates(a, b)
+    m["net"] = net_rates(a, b); m["cdt"] = dt
     n, ia = H.parse_table(a["interrupts"]); _, ib = H.parse_table(b["interrupts"]); rows = []
     for k, (cb, desc) in ib.items():
         d = [y - x for x, y in zip(ia.get(k, ([0] * n, ""))[0], cb)]
@@ -447,10 +472,14 @@ def metrics(c):
     m["thr_ok"] = ta is not None and tb is not None and not (ta & 0xF) and not (tb & 0xF) and not (tb & ~ta & 0xF0000)
     return m
 
-def checks_for(tag, c, m):
+def checks_for(tag, c, m, params):
+    if "defekt" in c:
+        return [("%s: Daten lesbar (%s)" % (tag, c["defekt"]), False)]
     out = [("%s: logger_rc=0" % tag, c.get("rc") == 0 and not c.get("timeout") and c.get("logger_start") is not None),
            ("%s: Daten vollstaendig (N=%d, Soll %d)" % (tag, m["n"], c["dur"] * c["hz"]), m["n"] >= 0.98 * c["dur"] * c["hz"]),
            ("%s: Abtastrate %.3f Hz (Soll %d)" % (tag, m["fs"], c["hz"]), abs(m["fs"] - c["hz"]) < 0.01 * c["hz"]),
+           ("%s: Abtastung gleichmaessig (max dt %s ms, Luecken %d)" % (tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]),
+            c["dt_gaps"] == 0),
            ("%s: Wiedergabe %s (ist %.0f %%)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"]),
             abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) < 1e-9),
            ("%s: keine Unterspannung/Drosselung" % tag, m.get("thr_ok", False)),
@@ -459,13 +488,58 @@ def checks_for(tag, c, m):
         out.append(("%s: Abtastrate Musik konstant %s" % (tag, c["rates"]), len(c["rates"]) == 1))
     g = c.get("gen")
     if g:
-        out.append(("%s: Last %.1f von %.1f Hz, Verzug p99 %.2f ms, Fehler %d" % (tag, g["ist_hz"], g["soll_hz"],
-                    g["verzug_p99_ms"], g["fehler"]), abs(g["ist_hz"] - g["soll_hz"]) <= 0.02 * g["soll_hz"] and g["fehler"] == 0
-                    and g["verzug_p99_ms"] < 1.0))
+        out.append(("%s: Last %.1f von %.1f Hz, Verzug p99 %.2f ms, >1 ms %.1f %%, Fehler %d" % (tag, g["ist_hz"], g["soll_hz"],
+                    g["verzug_p99_ms"], g.get("anteil_ueber_1ms", float("nan")), g["fehler"]),
+                    abs(g["ist_hz"] - g["soll_hz"]) <= 0.02 * g["soll_hz"] and g["fehler"] == 0 and g["verzug_p99_ms"] < 2.0))
+        iface = {"E": params.get("end0_if", END0), "U": params.get("lan_if", LAN)}.get(tag[0])
+        if iface and "net" in m:
+            base = 0.0
+            tx = m["net"].get(iface, {}).get("txp", 0.0)
+            out.append(("%s: Verkehr verlaesst %s wirklich (tx %.1f Pak/s, erzeugt %.1f/s)" % (tag, iface, tx, g["ist_hz"]),
+                        tx - base >= 0.95 * g["ist_hz"]))
     return out
 
 def fmt(x, nd=2):
     return "n/a" if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))) else "%.*f" % (nd, x)
+
+def testable(fa, m):
+    return math.isfinite(m.get("df", float("nan"))) and 2 * m["df"] <= fa <= m["fs"] / 2 - 2 * m["df"]
+
+def sig_peaks(m, ref):
+    """signifikante Spitzen: >= 10x Umgebung und >= 4x Ruhe gleicher Rate."""
+    out = []
+    for fk, loc, rms in peaks(m.get("f") or [], m.get("psd") or [], top=30, ratio=10.0):
+        rr, _ = excess(m, ref, fk, 0.05)
+        if rr >= 4:
+            out.append((fk, loc, rms, rr))
+    return out
+
+def source_search(M, f0, span=25.0, step=0.01):
+    """Quellfrequenz nahe f0, deren Alias in P50 UND P47 je auf eine signifikante Spitze faellt."""
+    p50, p47 = M.get("P50"), M.get("P47")
+    if not p50 or not p47 or "f" not in p50 or "f" not in p47:
+        return []
+    s50, s47 = sig_peaks(p50, M.get("I50")), sig_peaks(p47, M.get("I47"))
+    if not s47:
+        return []
+    hits = []
+    n = int(2 * span / step)
+    for i in range(n + 1):
+        fq = f0 - span + i * step
+        a50, a47 = alias(fq, p50["fs"]), alias(fq, p47["fs"])
+        k50 = [pk for pk in s50 if abs(pk[0] - a50) <= p50["df"]]
+        k47 = [pk for pk in s47 if abs(pk[0] - a47) <= p47["df"]]
+        blind50 = not testable(a50, p50)        # Quelle ~Vielfaches von fs: bei 50 Hz unsichtbar
+        if k47 and (k50 or blind50):
+            hits.append((fq, a50, a47, k50[0][2] if k50 else float("nan"), k47[0][2]))
+    # zusammenhaengende Treffer zu Intervallen buendeln
+    out = []
+    for h in hits:
+        if out and h[0] - out[-1][-1][0] <= 2 * step:
+            out[-1].append(h)
+        else:
+            out.append([h])
+    return [(g[0][0], g[-1][0], g[len(g) // 2]) for g in out]
 
 def analyse(cdir):
     L, S, checks = [], [], []
@@ -476,77 +550,97 @@ def analyse(cdir):
     hd = "vschwank %s  host=%s  start=%s  Dauer je Bedingung %d s%s" % (meta["version"], meta["host"], meta["start"],
          meta["dur"], "  TESTMODUS" if meta.get("test_mode") else "")
     L.append(hd); S.append(hd)
-    params = H.rjson(os.path.join(cdir, "params.json")) if os.path.isfile(os.path.join(cdir, "params.json")) else {}
-    tags = ["P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "I50b"]
-    C, M = {}, {}
-    for t in tags:
-        c = load_cond(cdir, t)
-        if c:
-            C[t] = c; M[t] = metrics(c); checks += checks_for(t, c, M[t])
+    pp = os.path.join(cdir, "params.json")
+    params = H.rjson(pp) if os.path.isfile(pp) else {}
     lan = params.get("lan_if", LAN)
+    C, M = {}, {}
+    soll = TAGS if meta.get("music") else TAGS[2:]
+    for t in soll:
+        c = load_cond(cdir, t)
+        if c is None:
+            checks.append(("%s: Bedingung vorhanden" % t, False)); continue
+        C[t] = c
+        M[t] = metrics(c) if "defekt" not in c else {}
+        checks += checks_for(t, c, M[t], params)
+    if not meta.get("music"):
+        S.append("HINWEIS: ohne Musik gemessen - kein P50/P47, Alias-Nachweis und Varianzanteile nicht moeglich.")
+        L.append(S[-1])
     if params:
-        S.append("Nachbildung: end0 %.1f Pak/s x %d B | %s %.1f Pak/s x %d B | CPU %.1f Hz (%s)" % (
-            params["end0_hz"], params["end0_payload"], lan, params["lan_hz"], params["lan_payload"], params["cpu_hz"], params["quelle"]))
-    # Tabelle
-    hdr = "Bed.  fs[Hz]  mean[V]   sd   P0,1-Ruhe  | rms 0,02-0,2 0,2-2 2-10 >10 Hz [mV] | ADEV 0,04/0,64/2,56 s"
+        S.append("Nachbildung: end0 %.1f Pak/s x %d B | %s %.1f Pak/s x %d B (TX-Ersatz fuer RX) | CPU %.1f Hz | %s" % (
+            params["end0_hz"], params["end0_payload"], lan, params["lan_hz"], params["lan_payload"], params["cpu_hz"],
+            params.get("quelle", "")))
+        L.append(S[-1])
+    hdr = "Bed.  fs[Hz]  mean[V]  sd[mV] var>0,1Hz[mV2] mean-P0,1[mV] | rms 0,1-0,5 0,5-2 2-10 >10 Hz [mV] | ADEV 0,04/0,64/2,56 s [mV]"
     L.append(""); L.append(hdr); S.append(""); S.append(hdr)
-    base = M.get("I50", {}).get("mean")
-    for t in tags:
+    for t in TAGS:
         m = M.get(t)
         if not m or "sd" not in m:
             continue
         ad = m["adev"]
-        line = "%-5s %6.2f %8.4f %5.2f %8s   | %s | %s" % (
-            t, m["fs"], m["mean"] / 1000, m["sd"], fmt(m["p01"] - base if base else None),
+        line = "%-5s %6.2f %8.4f %6.2f %8.2f %12.2f    | %s | %s" % (
+            t, m["fs"], m["mean"] / 1000, m["sd"], m["var_hf"], m["mean"] - m["p01"],
             " ".join("%5s" % fmt(b) for b in m["bands"]), "/".join(fmt(ad.get(x)) for x in (0.04, 0.64, 2.56)))
         L.append(line); S.append(line)
-    # Spektrale Spitzen
-    L.append(""); L.append("Spektrale Spitzen (Frequenz Hz / Faktor ueber Umgebung / rms mV / R=Faktor ggue. Ruhe gleicher Rate):")
-    S.append(""); S.append("Spitzen:")
-    for t in tags:
+    L.append(""); L.append("Signifikante Spitzen (>=10x Umgebung, >=4x Ruhe gleicher Rate): Frequenz Hz / x Umgebung / rms mV / x Ruhe")
+    S.append(""); S.append("Signifikante Spitzen (f Hz/xUmg/rms mV/xRuhe):")
+    for t in TAGS:
         m = M.get(t)
-        if m and m.get("peaks") is not None and "sd" in m:
-            ref = M.get("I47" if t.endswith("47") else "I50")
-            txt = "; ".join("%.2f/%.0fx/%.2f/R%s" % (pk + (fmt(excess(m, ref, pk[0], 0.05)[0], 0),)) for pk in m["peaks"]) or "keine"
-            L.append("  %-5s %s" % (t, txt)); S.append("  %-5s %s" % (t, txt))
+        if not m or "f" not in m or t.startswith("I"):
+            continue
+        ref = M.get("I47" if t.endswith("47") else "I50")
+        sp = sig_peaks(m, ref)[:4]
+        txt = "; ".join("%.2f/%.0f/%.2f/%.0f" % pk for pk in sp) or "keine"
+        L.append("  %-5s %s" % (t, txt)); S.append("  %-5s %s" % (t, txt))
     # Alias-Test
+    L.append(""); S.append("")
+    L.append("Alias-Test (Vorhersage aus gemessener Abtastrate; Faktor ggue. Ruhe/Umgebung; SPITZE wenn >=4 und >=10;"
+             " 'n.p.' = Alias liegt bei 0 Hz oder Nyquist, nicht pruefbar):"); S.append("Alias-Test:")
     cands = []
     if params:
-        cands = [("Diretta-Zyklus", params["end0_hz"]), ("2x Zyklus", 2 * params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])]
-    L.append(""); L.append("Alias-Test (Vorhersage aus gemessener Abtastrate; Faktor = PSD ggue. Ruhe gleicher Rate / ggue. Umgebung;"
-             " SPITZE wenn >= 4 ggue. Ruhe UND >= 10 ggue. Umgebung):")
-    S.append(""); S.append("Alias-Test:")
-    for name, fsrc in cands:
+        fz = params["end0_hz"]
+        cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
+                 ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
+    for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
+        if t in C and C[t].get("gen"):
+            cands.append(("%s erzeugt" % t, C[t]["gen"]["ist_hz"], (t,)))
+    for name, fsrc, conds in cands:
         res = []
-        for t in ("P50", "P47", "E50", "E47"):
+        for t in conds:
             m = M.get(t)
-            if not m or not m.get("f"):
+            if not m or "f" not in m:
                 continue
             fa = alias(fsrc, m["fs"])
-            ref = M.get("I47" if t.endswith("47") else "I50")
-            rr, loc = excess(m, ref, fa)
-            hit = rr >= 4 and loc >= 10
-            res.append("%s %.2f Hz %s/%s%s" % (t, fa, fmt(rr, 0), fmt(loc, 0), " SPITZE" if hit else ""))
-        line = "  %-15s %7.1f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
+            if not testable(fa, m):
+                res.append("%s %.2f Hz n.p." % (t, fa)); continue
+            rr, loc = excess(m, M.get("I47" if t.endswith("47") else "I50"), fa)
+            res.append("%s %.2f Hz %s/%s%s" % (t, fa, fmt(rr, 0), fmt(loc, 0), " SPITZE" if rr >= 4 and loc >= 10 else ""))
+        line = "  %-15s %7.2f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
         L.append(line); S.append(line)
-    # Varianzanteile
-    if "I50" in M and "P50" in M and "sd" in M["I50"] and "sd" in M["P50"]:
-        vi, vp = M["I50"]["sd"] ** 2, M["P50"]["sd"] ** 2
-        L.append(""); S.append("")
-        head = "Zusatzvarianz Wiedergabe (P50-I50): %.2f mV^2 (sd %.2f -> %.2f mV)" % (vp - vi, M["I50"]["sd"], M["P50"]["sd"])
-        L.append(head); S.append(head)
-        for t, lab in (("E50", "end0-Verkehr"), ("U50", lan + "-Verkehr"), ("C50", "CPU-Wecker")):
-            if t in M and "sd" in M[t] and vp > vi:
-                ex = M[t]["sd"] ** 2 - vi
-                line = "  %-13s Zusatzvarianz %6.2f mV^2 = %5.0f %% der Wiedergabe-Zusatzvarianz (Naeherung)" % (lab, ex, 100 * ex / (vp - vi))
-                L.append(line); S.append(line)
-        if "I50b" in M and "sd" in M["I50b"]:
-            line = "  Stabilitaet Ruhe: I50 sd %.2f / I50b sd %.2f mV, Mittel %+.2f mV" % (
-                M["I50"]["sd"], M["I50b"]["sd"], M["I50b"]["mean"] - M["I50"]["mean"])
+    if params:
+        for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
+            ivs = source_search(M, f0)
+            line = "  Quellsuche %s +-25 Hz (Spitze in P47 und P50, oder P50 blind): %s" % (name, "; ".join(
+                "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
+                ", P50 blind" if math.isnan(h[3]) else "") for a, b, h in ivs) or "kein Treffer")
             L.append(line); S.append(line)
-    # Aktivitaet
+    # Varianzanteile (ohne Drift < 0,1 Hz)
+    if all(t in M and "var_hf" in M[t] for t in ("I50", "P50")):
+        vi, vp = M["I50"]["var_hf"], M["P50"]["var_hf"]
+        L.append(""); S.append("")
+        head = "Zusatzvarianz >0,1 Hz Wiedergabe (P50-I50): %.2f mV^2 (%.2f -> %.2f)" % (vp - vi, vi, vp)
+        L.append(head); S.append(head)
+        for t, lab in (("E50", "end0-Verkehr"), ("U50", lan + "-TX-Ersatz"), ("C50", "CPU-Wecker")):
+            if t in M and "var_hf" in M[t] and vp > vi:
+                ex = M[t]["var_hf"] - vi
+                line = "  %-15s %6.2f mV^2 = %5.0f %% der Wiedergabe-Zusatzvarianz (Naeherung)" % (lab, ex, 100 * ex / (vp - vi))
+                L.append(line); S.append(line)
+    if all(t in M and "mean" in M[t] for t in ("I50", "I50b")):
+        dmean = M["I50b"]["mean"] - M["I50"]["mean"]
+        rv = M["I50b"]["var_hf"] / M["I50"]["var_hf"] if M["I50"]["var_hf"] > 0 else float("nan")
+        checks.append(("Ruhe stabil: I50b-I50 Mittel %+.2f mV, Varianz x%.2f" % (dmean, rv), abs(dmean) <= 3.0 and 0.75 <= rv <= 1.33))
+    # Aktivitaet (Vollbericht)
     L.append(""); L.append("Aktivitaet je Bedingung:")
-    for t in tags:
+    for t in TAGS:
         m = M.get(t)
         if not m or "busy" not in m:
             continue
@@ -555,10 +649,11 @@ def analyse(cdir):
         L.append("        Netz: " + "; ".join("%s rx %.0f/%.0f tx %.0f/%.0f (Pak/s / kB/s)" % (
             k, v["rxp"], v["rxb"] / 1000, v["txp"], v["txb"] / 1000) for k, v in sorted(m["net"].items()) if v["rxp"] + v["txp"] > 0.5))
         L.append("        IRQ: " + "; ".join("%s %s %.0f/s [%s]" % (k, d, r, " ".join("%.0f" % x for x in per)) for r, k, d, per in m["irq"]))
-        if C[t].get("gen"):
-            g = C[t]["gen"]
-            L.append("        Last %s: %.2f/%.2f Hz, Verzug p50 %.3f p99 %.3f max %.3f ms, Fehler %d" % (
-                g["label"], g["ist_hz"], g["soll_hz"], g["verzug_p50_ms"], g["verzug_p99_ms"], g["verzug_max_ms"], g["fehler"]))
+        g = C[t].get("gen")
+        if g:
+            L.append("        Last %s: %.2f/%.2f Hz, Verzug p50 %.3f p99 %.3f max %.3f ms, >1 ms %.2f %%, neu aufgesetzt %d" % (
+                g["label"], g["ist_hz"], g["soll_hz"], g["verzug_p50_ms"], g["verzug_p99_ms"], g["verzug_max_ms"],
+                g.get("anteil_ueber_1ms", float("nan")), g.get("neu_aufgesetzt", 0)))
     nf = [x for x, ok in checks if not ok]
     L.append(""); L.append("Pruefungen: %d von %d bestanden" % (len(checks) - len(nf), len(checks)))
     L.extend("  [%s] %s" % ("PASS" if ok else "FAIL", x) for x, ok in checks)
@@ -568,16 +663,16 @@ def analyse(cdir):
 
 def compare(a, b):
     out = ["Vergleich A=%s  B=%s" % (os.path.basename(a), os.path.basename(b)),
-           "Bed.   sd_A   sd_B   Diff  | mean_A    mean_B   | rms 2-10 Hz A/B"]
-    for t in ("P50", "P47", "I50", "I47", "E50", "E47", "U50", "C50", "I50b"):
+           "Bed.   sd_A   sd_B   Diff  | var>0,1Hz A/B [mV2] | mean_A    mean_B   | rms 2-10 Hz A/B"]
+    for t in TAGS:
         ca, cb = load_cond(a, t), load_cond(b, t)
-        if not ca or not cb:
+        if not ca or not cb or "defekt" in ca or "defekt" in cb:
             continue
         ma, mb = metrics(ca), metrics(cb)
         if "sd" not in ma or "sd" not in mb:
             continue
-        out.append("%-5s %6.2f %6.2f %+6.2f | %8.4f %8.4f | %s/%s" % (t, ma["sd"], mb["sd"], mb["sd"] - ma["sd"],
-                   ma["mean"] / 1000, mb["mean"] / 1000, fmt(ma["bands"][2]), fmt(mb["bands"][2])))
+        out.append("%-5s %6.2f %6.2f %+6.2f | %6.2f / %6.2f | %8.4f %8.4f | %s/%s" % (t, ma["sd"], mb["sd"], mb["sd"] - ma["sd"],
+                   ma["var_hf"], mb["var_hf"], ma["mean"] / 1000, mb["mean"] / 1000, fmt(ma["bands"][2]), fmt(mb["bands"][2])))
     return "\n".join(out) + "\n"
 
 
@@ -609,6 +704,15 @@ def selftest():
     f, p = welch(s, 47.0); pk = peaks(f, p)
     chk(pk and abs(pk[0][0] - 11.9) < 0.1, "Abtastung 505,1 Hz @47 Hz -> Spitze %.2f Hz" % (pk[0][0] if pk else -1))
     chk(abs(pct([1, 2, 3, 4], 50) - 2.5) < 1e-12 and pct([5], 99) == 5, "Perzentil")
+    # Quellsuche: 505,1-Hz-Quelle, abgetastet mit 49,996 und 47 Hz, gegen Rauschreferenz
+    def mk(fs, sig):
+        v = [random.gauss(0, 1.0) + (2.0 * math.sin(2 * math.pi * 505.1 * i / fs) if sig else 0.0) for i in range(int(180 * fs))]
+        f, p = welch(v, fs)
+        return {"f": f, "psd": p, "fs": fs, "df": f[1] - f[0]}
+    MM = {"P50": mk(49.996, True), "P47": mk(47.0, True), "I50": mk(49.996, False), "I47": mk(47.0, False)}
+    iv = source_search(MM, 505.0)
+    chk(any(a_ - 0.05 <= 505.1 <= b_ + 0.05 for a_, b_, _ in iv), "Quellsuche findet 505,1 Hz: %s" % [(round(a_, 2), round(b_, 2)) for a_, b_, _ in iv])
+    chk(not testable(alias(500.0, 50.0), MM["P50"]) and testable(alias(505.1, 49.996), MM["P50"]), "Pruefbarkeit (0 Hz = n.p.)")
     a = adev([float(i % 2) for i in range(1000)], 50.0)
     chk(abs(a[0.04] - 0.0) < 1e-12, "ADEV (Periode 2 bei tau=2 Samples = 0)")
     cnt = []
@@ -673,7 +777,18 @@ def main():
     print("Versuchsreihe gestartet: %d Bedingungen x %d s, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
         n, args.dur, round((n * (args.dur + 25) + 60) / 60)))
     print("Fortschritt:  python3 vschwank.py status      Abbruch:  python3 vschwank.py stop\n")
-    H.follow(logp, p)
+    pos = 0
+    try:
+        while True:
+            with open(logp) as f:
+                f.seek(pos); chunk = f.read(); pos = f.tell()
+            if chunk:
+                sys.stdout.write(chunk); sys.stdout.flush()
+            if p.poll() is not None and not chunk:
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\n(Anzeige beendet - Messung laeuft weiter. Fortschritt: python3 vschwank.py status)")
     return 0
 
 if __name__ == "__main__":
