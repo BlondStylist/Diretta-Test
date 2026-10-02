@@ -31,7 +31,7 @@ Kalibrierungen in `vschwank.py` (v1.2, geraetespezifisch, bei jeder Reihe neu):
    Erst danach ein „keine Spitze" als „keine Stoerung" deuten.
 2. **Lastempfindlichkeit**: Hub je voll belastetem Kern aus der Grundwelle (Gegenprobe zur hostmess-Laststufe).
 3. **Drift-Klammerung** `I50 / I50m / I50b`: Mittelwerte relativ zur zeitlich interpolierten Ruhe; Spanne der Klammern <= 3 mV gefordert.
-4. **Netzbrumm** 50/100/150 Hz als Alias-Kandidaten bei 47 Hz (Linear-Netzteile).
+4. **Netzbrumm/Fremdfrequenzen** 50/100/150 Hz (Alias nur bei 47 Hz sichtbar) sowie 60/120 Hz (bei 50 und 47 Hz sichtbar).
 Fehlerangaben: Varianz > 0,1 Hz mit Segment-Standardfehler, Nachweisgrenze fuer Spitzen. Absolutwert nur mit externem
 Multimeter kalibrierbar (nicht automatisiert); fuer Relativvergleiche nicht noetig.
 

@@ -734,7 +734,8 @@ def analyse(cdir):
         fz = params["end0_hz"]
         cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
                  ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
-    cands += [("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47"))]
+    cands += [("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47")),
+              ("60 Hz", 60.0, ("I50", "I47", "P50", "P47")), ("120 Hz", 120.0, ("I50", "I47", "P50", "P47"))]
     for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
         if t in C and C[t].get("gen"):
             cands.append(("%s erzeugt" % t, C[t]["gen"]["ist_hz"], (t,)))
