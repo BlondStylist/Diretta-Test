@@ -159,3 +159,17 @@ Target Pi 5 Rev 1.0, iFi iPower Elite 5 V/5 A, Diretta-Empfang end0 500,1 Pak/s 
 - Zuleitungswiderstand (quasi Gleichstrom) R50: Hub 19,66 ± 0,04 mV, 0,927 W → **94 mΩ** (86-103); Mittag (11:14, evtl. mit Musik) 105 mΩ.
 - FAIL: Modell (s.o.); R50-Gegenprobe gegen Modell (in 1.4.1 auf tiefste Kalibrierfrequenz umgestellt: 19,9 mV → ×0,99);
   Ruhe-Varianz I50b/I50 ×0,71 (I50 direkt nach Musikstopp erhoeht).
+
+## Frequenzgang der Versorgung am Target (vschwank.py 1.4.5 target, 03.10.2026 19:13, Kalibrierung gueltig)
+
+Gemessene Antwort auf identische Laststufe (Bezug Gleichstrom R50 = 20,42 ± 0,13 mV/Kern, R = 98 mΩ; Logger-Zeitstreuung 0,03 ms):
+
+| f [Hz] | 7,3 | 31 | 113 | 213 (@47: 1,57) | 313 | 513 | 1013 |
+|---|---|---|---|---|---|---|---|
+| Antwort | 1,00 ± 0,01 | 1,00 ± 0,02 | 1,17 | 1,59 | **2,34** | 1,21 | 1,00 |
+| ≈ \|Z\| [mΩ] | 98 | 98 | 114 | 156 | **230** | 119 | 98 |
+
+→ Innenwiderstand iFi + Zuleitung hat eine **Resonanzspitze zwischen ~300 und 500 Hz** (×2,3), bei 1 kHz wieder Gleichstromwert.
+Antwort bei 500 Hz (interpoliert) 1,27. Ruhe: Linie 12,94 Hz @47 (×46) → Quelle nahe 1 kHz dauerhaft. Musik: 9,64 Hz (2,04 mV) reproduziert.
+Musik-Teil dieses Laufs ungueltig (P50 nur 23 % Wiedergabe → Zyklus 117,7 statt 500 Pak/s erkannt, C47 entfallen);
+ab 1.4.6 wird eine Teilmessung bei Zustandswechsel automatisch wiederholt.

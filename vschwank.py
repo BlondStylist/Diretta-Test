@@ -34,7 +34,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -564,8 +564,9 @@ def net_rates(a, b):
 
 # ------------------------------------------------------------------ Versuchsreihe
 class Series:
-    def __init__(self, cdir, dur, with_music, kal_kurz=False, mode="voll"):
+    def __init__(self, cdir, dur, with_music, kal_kurz=False, mode="voll", ohne_kal=False):
         self.dir, self.dur, self.music, self.kal_kurz, self.mode = cdir, dur, with_music, kal_kurz, mode
+        self.ohne_kal = ohne_kal
         self.raw = os.path.join(cdir, "raw"); os.makedirs(self.raw, exist_ok=True)
         self.children, self.gen, self.params, self.state = [], None, {}, None
 
@@ -598,7 +599,16 @@ class Series:
                 raise SystemExit("Zeitueberschreitung beim Warten auf: " + txt)
             time.sleep(1.0)
 
-    def condition(self, tag, hz, want_play, gen=None, dur=None, pmic=False, settle=None):
+    def play_fraction(self, rows):
+        """Anteil Sekunden mit Wiedergabe im Messfenster (Target: end0-Paketrate, Host: ALSA) - wie in der Auswertung."""
+        if self.mode == "target":
+            fl = [(b["np"].get(END0, 0) - a["np"].get(END0, 0)) / (b["t"] - a["t"]) > PLAY_PPS
+                  for a, b in zip(rows, rows[1:]) if b["t"] > a["t"] and END0 in a.get("np", {}) and END0 in b.get("np", {})]
+        else:
+            fl = [bool(r["alsa"]) for r in rows]
+        return 100.0 * sum(fl) / len(fl) if fl else float("nan")
+
+    def condition(self, tag, hz, want_play, gen=None, dur=None, pmic=False, settle=None, attempt=0):
         only = os.environ.get("VS_ONLY")              # nur fuer Tests: Teilmenge der Bedingungen
         if only and tag not in only.split(","):
             return None
@@ -654,6 +664,16 @@ class Series:
         H.wjson(os.path.join(cd, "cond.json"), info)
         log("%s beendet: logger_rc=%s%s" % (tag, p.returncode, ("  Last %.4g/%.4g Hz" % (
             info["gen"]["ist_hz"], info["gen"]["soll_hz"])) if "gen" in info else ""))
+        if want_play is not None:
+            fr = self.play_fraction(smp.rows); soll = 100.0 if want_play else 0.0
+            tol = 1.0 if self.mode == "target" else 1e-9
+            if math.isfinite(fr) and abs(fr - soll) > tol:
+                if attempt < 2:
+                    log("WARN  %s: Musik %s nur %.0f %% der Zeit - Messung wird wiederholt (Versuch %d von 3)" % (
+                        tag, "an" if want_play else "aus", fr if want_play else 100 - fr, attempt + 2))
+                    self.state = None                       # erneut volle Beruhigung nach dem Zustandswechsel
+                    return self.condition(tag, hz, want_play, gen, dur, pmic, settle, attempt + 1)
+                log("FEHLER %s: Musikzustand auch im 3. Versuch nicht konstant - Daten bleiben als ungueltig markiert" % tag)
         return info
 
     def derive_target(self, play_info):
@@ -728,6 +748,8 @@ class Series:
             self.condition("C47x", 47, False, ("CPU0-Wecker Positivkontrolle %.0f us" % p["c47x_soll_us"], p["cpu_hz"],
                                                cpu_burst(p["c47x_busy_us"])))
         self.condition("I50m", 50, False)
+        if self.ohne_kal:
+            self.condition("I50b", 50, False); return
         for fk in KAL_F_TARGET:
             self.condition(ktag(fk), 50, False, ("Rechteck CPU0 %g Hz" % fk, fk, "rechteck"), dur=min(self.dur, KAL_DUR))
         self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"), dur=min(self.dur, KAL_DUR))
@@ -775,7 +797,7 @@ class Series:
             H.kill_group(p)
 
 
-def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll"):
+def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll", ohne_kal=False):
     lock = os.fdopen(lockfd, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -785,7 +807,7 @@ def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll"):
         os.sched_setaffinity(0, {H.CTL_CPU})
     except OSError as e:
         log("WARN  CPU-Bindung nicht moeglich: %s" % e)
-    s = Series(cdir, dur, music, kal_kurz, mode)
+    s = Series(cdir, dur, music, kal_kurz, mode, ohne_kal)
     def on_term(*_):
         raise SystemExit("durch stop beendet")
     signal.signal(signal.SIGTERM, on_term)
@@ -793,7 +815,7 @@ def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll"):
     try:
         pre = preflight(mode)
         H.wjson(os.path.join(cdir, "series.json"), {"version": VERSION, "hostmess": H.VERSION, "dur": dur,
-                "music": music, "kal_kurz": kal_kurz, "modus": mode, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
+                "music": music, "kal_kurz": kal_kurz, "modus": mode, "ohne_kal": ohne_kal, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
                 "kernel": os.uname().release, "pid": os.getpid(), "pre": pre,
                 "env": {k: v for k, v in os.environ.items() if k.startswith(("VS_", "HOSTMESS_"))},
                 "diretta_setting": setting_file()[1], "diretta_setting_datei": setting_file()[0], "test_mode": H.TEST})
@@ -1172,8 +1194,8 @@ def analyse(cdir):
     if mode == "widerstand":
         soll = ["R50"]
     elif mode == "target":
-        soll = ["P50", "P47", "I50", "I47", "C47", "C47x", "I50m"] + [ktag(f) for f in KAL_F_TARGET
-                                                                         if v14 or f not in (213.0, 513.0, 1013.0)] + ["K213b", "R50", "I50b"]
+        soll = ["P50", "P47", "I50", "I47", "C47", "C47x", "I50m"] + ([] if meta.get("ohne_kal") else [ktag(f) for f in KAL_F_TARGET
+                                                                         if v14 or f not in (213.0, 513.0, 1013.0)] + ["K213b", "R50"]) + ["I50b"]
     else:
         soll = [t for t in TAGS
                 if (meta.get("music") or t not in ("P50", "P47", "C47", "C47x"))
@@ -1197,6 +1219,9 @@ def analyse(cdir):
         checks += checks_for(t, c, M[t], params)
     if not meta.get("music") and mode != "widerstand":
         S.append("HINWEIS: ohne Musik gemessen - kein P50/P47, Alias-Nachweis und Varianzanteile nicht moeglich.")
+        L.append(S[-1])
+    if meta.get("ohne_kal"):
+        S.append("HINWEIS: ohne Kalibrierung gemessen (--ohne-kal) - Frequenzgang/Zuleitung aus frueherem Lauf verwenden.")
         L.append(S[-1])
     if mode == "target" and params:
         checks.append(("Target: Diretta-Zyklus aus gemessenem end0-Verkehr (%s)" % params.get("quelle", "?"),
@@ -1710,11 +1735,13 @@ def main():
     r.add_argument("--kal-kurz", action="store_true", help="nur 4 Kalibrierfrequenzen (7,3/213/513/1013 Hz) statt 8")
     w = sp.add_parser("widerstand"); w.add_argument("--dur", type=int, default=180)
     tg = sp.add_parser("target"); tg.add_argument("--dur", type=int, default=180)
+    tg.add_argument("--ohne-kal", action="store_true", help="nur Musik-/Mechanismus-Teil (Kalibrierung aus frueherem Lauf)")
     sp.add_parser("status"); sp.add_parser("stop"); sp.add_parser("selftest")
     a = sp.add_parser("analyse"); a.add_argument("ordner")
     v = sp.add_parser("vergleich"); v.add_argument("a"); v.add_argument("b")
     k = sp.add_parser("_child"); k.add_argument("dir"); k.add_argument("dur", type=int); k.add_argument("music", type=int)
     k.add_argument("lockfd", type=int); k.add_argument("kal_kurz", type=int); k.add_argument("mode")
+    k.add_argument("ohne_kal", type=int, nargs="?", default=0)
     args = ap.parse_args()
     if args.cmd == "selftest":
         return selftest()
@@ -1723,7 +1750,7 @@ def main():
     if args.cmd == "vergleich":
         print(compare(os.path.abspath(args.a), os.path.abspath(args.b)), end=""); return 0
     if args.cmd == "_child":
-        return child_main(args.dir, args.dur, bool(args.music), args.lockfd, bool(args.kal_kurz), args.mode)
+        return child_main(args.dir, args.dur, bool(args.music), args.lockfd, bool(args.kal_kurz), args.mode, bool(args.ohne_kal))
     curp = os.path.join(SHM, "current.json")
     cur = H.rjson(curp) if os.path.isfile(curp) else None
     if args.cmd == "status":
@@ -1754,14 +1781,15 @@ def main():
     logp = os.path.join(cdir, "run.log")
     with open(logp, "w") as lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_child", cdir, str(args.dur),
-                              str(0 if ohne else 1), str(lock.fileno()), str(int(kurz)), mode], stdin=subprocess.DEVNULL,
+                              str(0 if ohne else 1), str(lock.fileno()), str(int(kurz)), mode,
+                              str(int(mode == "target" and args.ohne_kal))], stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(lock.fileno(),))
     lock.close()
     H.wjson(curp, {"dir": cdir, "pid": p.pid})
     if mode == "widerstand":
         n, nk, tot = 1, 0, args.dur + 30
     elif mode == "target":
-        n, nk = 9, len(KAL_F_TARGET) + 1    # P50 P47 I50 I47 C47 C47x I50m R50 I50b + K... + K213b
+        n, nk = (8, 0) if args.ohne_kal else (9, len(KAL_F_TARGET) + 1)   # P50 P47 I50 I47 C47 C47x I50m (R50) I50b + K...
         tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE + 6
     else:
         nk = (len(KAL_KURZ) if kurz else len(KAL_F)) + 1
