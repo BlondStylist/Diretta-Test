@@ -127,3 +127,10 @@ FAIL-Pruefungen: I47 3 Abtastluecken (max 47 ms); R50 Vollstaendigkeit/Rate/Luec
 Logger ~40 ms, 360 Luecken bei 360 Abfragen; fuer Halbperioden-Mittel unschaedlich -> Pruefung in 1.3.1 angepasst);
 Ruhe I50b/I50 Varianz ×1,44 (I50b nur 15 s nach der Laststufe R50 -> 1.3.1 beruhigt 60 s).
 Varianzanteile @50 Hz (E50/C50) weiter durch Schwebung 0,05 Hz verfaelscht - nicht verwenden; 60-Hz-„SPITZE“ in P47 = 1000-Hz-Alias.
+
+## Zuleitungswiderstand Target (vschwank.py 1.3.1 widerstand, 03.10.2026 11:14, 11/11 Pruefungen)
+
+Target (Pi 5 Rev 1.0), iFi iPower Elite 5 V/5 A, fest verbautes DC-Kabel 1,5 m + Hohlstecker→USB-C-Adapter:
+Spannungshub 22,37 ± 0,22 mV je Kern, Leistungshub **0,947 ± 0,008 W**, EXT5V 5,087 V →
+**R = 105 mΩ** (96-114 mΩ für Wirkungsgrad 95-80 %). Keine Abtastluecken trotz PMIC-Abfrage (anders als Host).
+Vergleich Host (Tomanek): 129 mΩ (118-140). Host-Tomanek-Thema beendet: Host erhaelt ebenfalls ein iFi Elite 5 V/5 A.
