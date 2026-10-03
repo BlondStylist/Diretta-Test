@@ -1469,6 +1469,14 @@ def selftest():
     chk(not pl.is_alive() and time.monotonic() - t_ < 1.0, "Pacer mit 10-s-Periode sofort abbrechbar")
     dr = diretta_rt()
     chk(isinstance(dr.get("ns"), int) and dr["ns"] >= 0, "Diretta-Rechenzeit lesbar (%s, %d Threads-Namen)" % (dr["quelle"], len(dr["threads"])))
+    import tempfile
+    td = tempfile.mkdtemp()
+    nd = lambda rx, rb: ("Inter-|\n face |\n  end0: %d %d 0 0 0 0 0 0 %d %d 0 0 0 0 0 0\n" % (rb, rx, 9000, 100))
+    sr = Series(td, 60, True, mode="target")
+    sr.derive_target({"c0": {"t": 0.0, "netdev": nd(0, 0)}, "c1": {"t": 10.0, "netdev": nd(5000, 5000 * 1555)}})
+    chk(abs(sr.params["end0_hz"] - 500) < 1e-9 and sr.params["end0_rahmen_b"] == 1555 and sr.params["lan_if"] is None
+        and sr.params["quelle"].startswith("gemessen"), "Target: Diretta-Zyklus aus end0-Empfang (500 Pak/s x 1555 B)")
+    shutil.rmtree(td, ignore_errors=True)
     print("SELBSTTEST %s" % ("BESTANDEN" if ok else "NICHT BESTANDEN"))
     return 0 if ok else 1
 
