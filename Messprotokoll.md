@@ -134,3 +134,28 @@ Target (Pi 5 Rev 1.0), iFi iPower Elite 5 V/5 A, fest verbautes DC-Kabel 1,5 m +
 Spannungshub 22,37 ± 0,22 mV je Kern, Leistungshub **0,947 ± 0,008 W**, EXT5V 5,087 V →
 **R = 105 mΩ** (96-114 mΩ für Wirkungsgrad 95-80 %). Keine Abtastluecken trotz PMIC-Abfrage (anders als Host).
 Vergleich Host (Tomanek): 129 mΩ (118-140). Host-Tomanek-Thema beendet: Host erhaelt ebenfalls ein iFi Elite 5 V/5 A.
+
+## Target-Ursachenanalyse (vschwank.py 1.4 target, 03.10.2026 16:18, 116/119 Pruefungen)
+
+Target Pi 5 Rev 1.0, iFi iPower Elite 5 V/5 A, Diretta-Empfang end0 500,1 Pak/s × 1537 B.
+
+| Bed. | sd mV | Varianz >0,1 Hz mV² | Mittel V |
+|---|---|---|---|
+| P50 Musik | 4,36 | 18,14 | 5,0941 |
+| P47 Musik | 5,19 | 26,73 | 5,0931 |
+| I50 Ruhe | 3,03 | 9,14 | 5,0986 |
+| I47 Ruhe | 2,82 | 7,92 | 5,0984 |
+| I50b Ruhe (Ende) | 2,68 | 6,53 | 5,0977 |
+
+- **500-Hz-Linie klein: 0,43 ± 0,06 mV** (Host: 1,58). Diretta-Rechenzeit +18,2 µs/Zyklus; erwartet aus Positivkontrolle
+  C47x 0,50 mV = 116 ± 17 % → **am Target erklaert das CPU-Aufwachen die 500-Hz-Linie vollstaendig**. 1000 Hz: 0,94 mV (nicht signifikant).
+- Neue Linie nur bei Musik: **~9,6 Hz** (P47 9,64 Hz 1,96 mV ×30 Ruhe; P50 9,57/10,45 Hz) - gleiche Frequenz bei 50 und 47 Hz
+  Abtastung → echte langsame Quelle, kein Alias. Hypothese (ungeprueft): ALSA-Periode am Target (96000/9,6 = 10000 Frames).
+- In Ruhe dauerhaft Anteil nahe Vielfachen von 50 Hz (Band 0,1-0,5 Hz @50 Hz ~1,7-2,0 mV, @47 Hz nur 0,27 mV; I47 bei 13,0 Hz
+  ×8 Umgebung) → Kandidat 1-kHz-Takt (USB-Rahmen), ungeprueft.
+- **Frequenzgang der Versorgung steigt**: Antwort auf identische Laststufe K7 8,97 → K31 9,19 → K113 10,56 → K213b 14,30 →
+  K313 22,06 mV (×2,5 von 7 auf 313 Hz). Am Host (Tomanek) flach (0,98-1,00). → Innenwiderstand iFi + Zuleitung waechst mit der
+  Frequenz; Sensor-Modell daher nicht anwendbar (Restfehler 43 %, FAIL korrekt).
+- Zuleitungswiderstand (quasi Gleichstrom) R50: Hub 19,66 ± 0,04 mV, 0,927 W → **94 mΩ** (86-103); Mittag (11:14, evtl. mit Musik) 105 mΩ.
+- FAIL: Modell (s.o.); R50-Gegenprobe gegen Modell (in 1.4.1 auf tiefste Kalibrierfrequenz umgestellt: 19,9 mV → ×0,99);
+  Ruhe-Varianz I50b/I50 ×0,71 (I50 direkt nach Musikstopp erhoeht).

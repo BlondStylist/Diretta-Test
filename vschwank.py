@@ -33,7 +33,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.4"
+VERSION = "1.4.1"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -1090,6 +1090,12 @@ def analyse(cdir):
         sp = sig_peaks(m, ref)[:4]
         txt = "; ".join("%.2f/%.0f/%.2f/%.0f" % pk for pk in sp) or "keine"
         L.append("  %-5s %s" % (t, txt)); S.append("  %-5s %s" % (t, txt))
+    for t in ("I50", "I47"):
+        m = M.get(t)
+        if m and "f" in m:
+            sp = peaks(m["f"], m["psd"], top=4, ratio=10.0)
+            txt = "; ".join("%.2f/%.0f/%.2f" % pk for pk in sp) or "keine"
+            line = "  %-5s %s  (Ruhe: nur >= 10x Umgebung, f/xUmg/rms)" % (t, txt); L.append(line); S.append(line)
     if mode != "widerstand":
         # Alias-Test
         L.append(""); S.append("")
@@ -1128,7 +1134,7 @@ def analyse(cdir):
                 ivs = source_search(M, f0)
                 fit_ = kal_fit(M, C)[1]
                 def corr(fq, rms):
-                    if not fit_:
+                    if not fit_ or fit_[2] > 0.15:
                         return ""
                     hq = sinc_h(fq, fit_[0])
                     return ", korrigiert %s mV (H=%.2f, Modell)" % (fmt(rms / hq), hq) if hq >= 0.2 else ", H=%.2f zu klein fuer Korrektur" % hq
@@ -1159,7 +1165,9 @@ def analyse(cdir):
         L.append(""); S.append("")
         hd = "Kalibrierung 1 - Frequenzgang Messkette (Rechtecklast CPU0, Grundwellen-rms am Alias, auf 50 % Tastverhaeltnis korrigiert):"
         L.append(hd); S.append(hd)
-        a_ref = fit[1] if fit else (krow[0][3] if krow else float("nan"))
+        good = bool(fit) and fit[2] <= 0.15
+        a_low = next((r_[3] for r_ in krow if r_[5]), float("nan"))     # tiefste signifikante Stuetzstelle (quasi Gleichstrom)
+        a_ref = fit[1] if good else a_low
         for t, fk, fa, a, rr, ok, d in krow:
             line = "  %-5s %6.1f Hz -> Alias %5.2f Hz  rms %s mV (Tastv. %s %%)  x%s ggue. Ruhe  H=%s%s" % (
                 t, fk, fa, fmt(a), fmt(100 * d, 0), fmt(rr, 0), fmt(a / a_ref if a_ref > 0 else float("nan")),
@@ -1176,9 +1184,17 @@ def analyse(cdir):
                 1000 * T, 100 * rel, " - MODELL PASST SCHLECHT" if rel > 0.15 else "", sinc_h(500, T), sinc_h(1000, T))
             L.append(line); S.append(line)
             checks.append(("Kalibrierung: Frequenzgang-Modell passt (Restfehler %.0f %% <= 15 %%)" % (100 * rel), rel <= 0.15))
+            amps = [r_[3] for r_ in krow if r_[5]]; frs = [r_[1] for r_ in krow if r_[5]]
+            if not good and len(amps) >= 2 and amps[-1] > 1.3 * amps[0]:
+                for line in ("  -> Die Antwort STEIGT mit der Frequenz (x%.2f von %g auf %g Hz). Ein mittelnder Sensor kann das nicht;"
+                             % (amps[-1] / amps[0], frs[0], frs[-1]),
+                             "     Ursache ist die Versorgung (Innenwiderstand von Netzteil/Zuleitung waechst mit der Frequenz)."
+                             " H-Werte oben = Impedanz relativ zur tiefsten Frequenz; keine 1/H-Korrektur."):
+                    L.append(line); S.append(line)
             # Kalibrierung 2: Lastempfindlichkeit aus der Grundwelle (Rechteck-Hub = Absenkung je Kern)
-            hub = a0 / SQ_FUND
-            line = "  Kalibrierung 2 - Lastempfindlichkeit: Hub %.1f mV je voll belastetem Kern (Gegenprobe hostmess-Laststufe 25,2 mV)" % hub
+            hub = (a0 if good else a_low) / SQ_FUND
+            line = "  Kalibrierung 2 - Lastempfindlichkeit: Hub %.1f mV je voll belastetem Kern (%s; Host-Referenz hostmess 25,2 mV)" % (
+                hub, "aus Modell" if good else "aus tiefster Stuetzstelle")
             L.append(line); S.append(line)
         else:
             line = "  Frequenzgang-Modell nicht bestimmbar (< 3 signifikante Stuetzstellen)"
@@ -1288,11 +1304,12 @@ def analyse(cdir):
                            ra["dv"] > 0 and zv >= 10))
             checks.append(("R50: Leistungshub klar und plausibel (%.3f W = %.1f-fach Standardfehler; 0,3..5 W)" % (ra["dp"], zp),
                            0.3 <= ra["dp"] <= 5.0 and zp >= 10))
-            if fit:
-                hub = fit[1] / SQ_FUND; q = ra["dv"] / hub if hub > 0 else float("nan")
-                line = "  Gegenprobe: Hub je Kern aus Frequenzgang-Kalibrierung %.1f mV -> Laststufe/Kalibrierung x%.2f" % (hub, q)
+            klow = next((r_ for r_ in krow if r_[5]), None)
+            if klow:      # R50 ist quasi Gleichstrom: Vergleich mit der tiefsten Kalibrierfrequenz, nicht mit dem Modell
+                hub = klow[3] / SQ_FUND; q = ra["dv"] / hub if hub > 0 else float("nan")
+                line = "  Gegenprobe: Hub je Kern aus %s (%g Hz) %.1f mV -> Laststufe/Kalibrierung x%.2f" % (klow[0], klow[1], hub, q)
                 L.append(line); S.append(line)
-                checks.append(("R50: Laststufe stimmt mit Frequenzgang-Kalibrierung ueberein (x%.2f, 0,75..1,33)" % q, 0.75 <= q <= 1.33))
+                checks.append(("R50: Laststufe stimmt mit tiefster Kalibrierfrequenz ueberein (x%.2f, 0,85..1,18)" % q, 0.85 <= q <= 1.18))
             line = ("  Hinweis: Wirkungsgrad der PMIC-Wandler nicht messbar (Annahme %.0f-%.0f %%); fuer Vorher/Nachher-Vergleiche"
                     " am selben Pi kuerzt er sich heraus." % (100 * ETA[0], 100 * ETA[2]))
             L.append(line); S.append(line)
