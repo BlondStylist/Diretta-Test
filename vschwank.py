@@ -1326,9 +1326,15 @@ def analyse(cdir):
             line = "  Gegenprobe Last-Grundwelle (blockweise / an Logger-Zeitpunkten): " + "; ".join(
                 "%s %.3f/%.3f" % (r["tag"], r["c_b"], r["c_a"]) for r in both_)
             L.append(line)
-            dis = [r["tag"] for r in both_ if r["f"] <= 313 and abs(r["c_b"] / r["c_a"] - 1) > 0.10]
-            checks.append(("Kalibrierung: beide Last-Bestimmungen stimmen bis 313 Hz ueberein (<= 10 %%)%s" % (
-                (" - abweichend: %s" % dis) if dis else ""), not dis))
+            # vergleichbar nur, wenn die Logger-Zeitstempel fuer diese Frequenz genau genug sind (2 pi f sigma_dt < 0,3)
+            cmp_ = [r for r in both_ if r.get("dtsd") is not None and math.isfinite(r["dtsd"])
+                    and 2 * math.pi * r["f"] * r["dtsd"] / 1000 < 0.3]
+            dis = [r["tag"] for r in cmp_ if abs(r["c_b"] / r["c_a"] - 1) > 0.10]
+            if cmp_:
+                checks.append(("Kalibrierung: beide Last-Bestimmungen stimmen ueberein (<= 10 %%, verglichen: %s)%s" % (
+                    ",".join(r["tag"] for r in cmp_), (" - abweichend: %s" % dis) if dis else ""), not dis))
+            else:
+                L.append("  (Gegenprobe nicht vergleichbar: Zeitstempel-Streuung des Loggers zu gross fuer diese Frequenzen)")
         if kref:
             line = "  Bezug (Gleichstrom): %s, Hub %.2f +- %.2f mV je voll belastetem Kern%s" % (
                 kref["quelle"], kref["hub"], kref["se"], " = Kalibrierung 2 (Lastempfindlichkeit)")
