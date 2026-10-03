@@ -6,6 +6,8 @@ kein sudo, aendert keine Konfiguration.
 
   python3 vschwank.py run [--dur S] [--ohne-musik]   Versuchsreihe starten (laeuft abgekoppelt weiter)
   python3 vschwank.py widerstand [--dur S]          nur Zuleitungswiderstand messen (auch am Target, Musik egal)
+  python3 vschwank.py target [--dur S]              Reihe fuer den Diretta-TARGET (Empfaenger): P50/P47/I50/I47, C47/C47x,
+                                                    Kalibrierung K7/K113/K313/K213b, R50; Musikzustand = end0-Empfangsrate
   python3 vschwank.py status | stop
   python3 vschwank.py analyse ORDNER                 Bericht neu erzeugen (schreibt nichts)
   python3 vschwank.py vergleich ORDNER_A ORDNER_B    Vorher/Nachher-Vergleich zweier Reihen
@@ -53,6 +55,8 @@ R_SKIP = 2.0                                                    # je Halbperiode
 PMIC_DT = 0.5                                                   # PMIC-Abfrage R50 [s]
 ETA = (0.80, 0.875, 0.95)                                       # Wirkungsgrad PMIC-Wandler (Annahme, Spanne)
 MECH_DUTY = 0.10                                                # C47x: Tastverhaeltnis der Positivkontrolle
+KAL_F_TARGET = (7.3, 113.0, 313.0)                              # Target: 3 Stuetzstellen + K213b (Fit braucht >= 3)
+PLAY_PPS = float(os.environ.get("VS_PLAY_PPS", "200"))          # Target: Wiedergabe = end0-Empfang > 200 Pak/s
 log = H.log
 
 
@@ -410,6 +414,16 @@ def diretta_us(p_info, i_info, hz):
 
 
 # ------------------------------------------------------------------ Zaehler
+def end0_rx_pps(dt):
+    a = H.parse_netdev(H.rd("/proc/net/dev")).get(END0, {}).get("rxp", 0); t0 = time.monotonic()
+    time.sleep(dt)
+    b = H.parse_netdev(H.rd("/proc/net/dev")).get(END0, {}).get("rxp", 0)
+    return (b - a) / (time.monotonic() - t0)
+
+def setting_file():
+    f = sorted(glob.glob("/opt/diretta*/setting.inf"))
+    return (f[0], H.rd(f[0], None)) if f else (None, None)
+
 def counters():
     d = diretta_rt()          # vor dem Zeitstempel: Suche dauert einige 10 ms, Messfenster beginnt danach
     return {"t": H.now_boot(), "stat": H.rd("/proc/stat"), "interrupts": H.rd("/proc/interrupts"),
@@ -431,16 +445,23 @@ class Series:
         self.raw = os.path.join(cdir, "raw"); os.makedirs(self.raw, exist_ok=True)
         self.children, self.gen, self.params, self.state = [], None, {}, None
 
+    def playing(self):
+        """Host: ALSA-Zustand. Target: end0-Empfangsrate (Diretta sendet nur bei Wiedergabe ~500 Pak/s); unabhaengig davon,
+        ob der Target-Dienst das ALSA-Geraet zwischen Titeln offen haelt."""
+        if self.mode != "target":
+            return H.alsa_state()[0]
+        return end0_rx_pps(0.5) > PLAY_PPS
+
     def wait_state(self, want, settle=None):
         txt = "Musik STARTEN (96 kHz, Wiederholung an)" if want else "Musik STOPPEN"
         t_end = time.monotonic() + WAIT_MAX; ann = 0
         while True:
-            if H.alsa_state()[0] == want:
+            if self.playing() == want:
                 settle = settle if settle is not None else (SETTLE_SAME if self.state == want else SETTLE_CHANGE)
                 log("Zustand %s erkannt - %.0f s Beruhigung" % ("Wiedergabe" if want else "Ruhe", settle))
                 t_s = time.monotonic() + settle; ok = True
                 while time.monotonic() < t_s:
-                    if H.alsa_state()[0] != want:
+                    if self.playing() != want:
                         ok = False; break
                     time.sleep(0.5)
                 if ok:
@@ -505,6 +526,16 @@ class Series:
             info["gen"]["ist_hz"], info["gen"]["soll_hz"])) if "gen" in info else ""))
         return info
 
+    def derive_target(self, play_info):
+        """Target: Diretta-Zyklus = end0-EMPFANGSrate in P50 (keine Netz-Nachbildung moeglich: Sender ist der Host)."""
+        e = (net_rates(play_info["c0"], play_info["c1"]) if play_info else {}).get(END0, {})
+        ok = e.get("rxp", 0) > 50
+        p = {"end0_hz": e["rxp"] if ok else 500.0, "end0_rahmen_b": int(e["rxb"] / e["rxp"]) if ok else 0,
+             "cpu_hz": e["rxp"] if ok else 500.0, "end0_if": END0, "lan_if": None, "richtung": "rx",
+             "quelle": "gemessen end0-Empfang (P50)" if ok else "Standardwert 500 (P50 ohne end0-Empfang!)"}
+        self.params = p; self.save_params()
+        log("Target: Diretta-Empfang end0 %.1f Pak/s x %d B Rahmen (%s)" % (p["end0_hz"], p["end0_rahmen_b"], p["quelle"]))
+
     def derive(self, play_info):
         """Nachbildungs-Parameter aus der gemessenen Wiedergabe (P50)."""
         nr = net_rates(play_info["c0"], play_info["c1"]) if play_info else {}
@@ -554,10 +585,31 @@ class Series:
                                                    p["c47x_cpu_abgleich_us"]))
         return True
 
+    def run_target(self):
+        P = self.condition("P50", 50, True)
+        self.condition("P47", 47, True)
+        self.derive_target(P)
+        p = self.params
+        I = self.condition("I50", 50, False)
+        self.condition("I47", 47, False)
+        if self.mech_params(P, I):
+            self.condition("C47", 47, False, ("CPU0-Wecker wie Diretta %.0f us" % p["diretta_us"], p["cpu_hz"],
+                                              cpu_burst(p["c47_busy_us"])))
+            self.condition("C47x", 47, False, ("CPU0-Wecker Positivkontrolle %.0f us" % p["c47x_soll_us"], p["cpu_hz"],
+                                               cpu_burst(p["c47x_busy_us"])))
+        self.condition("I50m", 50, False)
+        for fk in KAL_F_TARGET:
+            self.condition(ktag(fk), 50, False, ("Rechteck CPU0 %g Hz" % fk, fk, "rechteck"), dur=min(self.dur, KAL_DUR))
+        self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"), dur=min(self.dur, KAL_DUR))
+        self.condition("R50", 50, False, ("Laststufe CPU0 %g Hz" % R_FREQ, R_FREQ, "rechteck"), pmic=True)
+        self.condition("I50b", 50, False, settle=SETTLE_CHANGE)
+
     def run(self):
         if self.mode == "widerstand":
             self.condition("R50", 50, None, ("Laststufe CPU0 %g Hz" % R_FREQ, R_FREQ, "rechteck"), pmic=True)
             return
+        if self.mode == "target":
+            return self.run_target()
         P = None
         if self.music:
             P = self.condition("P50", 50, True)
@@ -614,7 +666,7 @@ def child_main(cdir, dur, music, lockfd, kal_kurz=False, mode="voll"):
                 "music": music, "kal_kurz": kal_kurz, "modus": mode, "start": time.strftime("%Y-%m-%dT%H:%M:%S"), "host": os.uname().nodename,
                 "kernel": os.uname().release, "pid": os.getpid(), "pre": pre,
                 "env": {k: v for k, v in os.environ.items() if k.startswith(("VS_", "HOSTMESS_"))},
-                "diretta_setting": H.rd("/opt/diretta-alsa/setting.inf", None), "test_mode": H.TEST})
+                "diretta_setting": setting_file()[1], "diretta_setting_datei": setting_file()[0], "test_mode": H.TEST})
         s.run(); done = True
     except SystemExit as e:
         log("== ABBRUCH: %s" % e); rc = 1
@@ -680,6 +732,9 @@ def preflight(mode="voll"):
     p_, u_, rails_ = parse_pmic(H.sh(["vcgencmd", "pmic_read_adc"], timeout=5))
     if not (math.isfinite(p_) and "VDD_CORE" in rails_ and math.isfinite(u_)):
         errs.append("vcgencmd pmic_read_adc liefert keine Schienenstroeme (VDD_CORE/EXT5V)")
+    if mode == "target":
+        if END0 not in H.parse_netdev(H.rd("/proc/net/dev")) and not H.TEST:
+            errs.append("Netzwerkschnittstelle fehlt: " + END0)
     if mode == "voll":
         if not glob.glob(H.ALSA_GLOB):
             errs.append("kein ALSA-Wiedergabegeraet")
@@ -787,13 +842,15 @@ def checks_for(tag, c, m, params):
                 ("%s: Luecken nur durch PMIC-Abfrage (%d Luecken bei %d Abfragen, max dt %s ms < 100)" % (
                     tag, c["dt_gaps"], npm, fmt(1000 * c["dt_max"], 1)), c["dt_gaps"] <= npm + 3 and c["dt_max"] < 0.1)]
     out += [
-           (("%s: Wiedergabe %s (ist %.0f %%)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"]),
-             abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) < 1e-9) if c["want_play"] is not None else
+           (("%s: Wiedergabe %s (ist %.0f %%%s)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"],
+                                                   ", aus end0-Paketrate, Toleranz 3 %" if c.get("modus") == "target" else ""),
+             abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) <= (3.0 if c.get("modus") == "target" else 1e-9))
+            if c["want_play"] is not None else
             ("%s: Musikzustand waehrend der Messung konstant (Wiedergabe %.0f %%)" % (tag, c["alsa_frac"]),
              c["alsa_frac"] in (0.0, 100.0))),
             ("%s: keine Unterspannung/Drosselung" % tag, m.get("thr_ok", False)),
             ("%s: Sampler ohne Fehler" % tag, c.get("sampler_err") is None)]
-    if c["want_play"] or (c["want_play"] is None and c["alsa_frac"] == 100.0):
+    if (c["want_play"] or (c["want_play"] is None and c["alsa_frac"] == 100.0)) and not (c.get("modus") == "target" and not c["rates"]):
         out.append(("%s: Abtastrate Musik konstant %s" % (tag, c["rates"]), len(c["rates"]) == 1))
     g = c.get("gen")
     if g:
@@ -960,6 +1017,8 @@ def analyse(cdir):
     v13 = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:2]) >= (1, 3)
     if mode == "widerstand":
         soll = ["R50"]
+    elif mode == "target":
+        soll = ["P50", "P47", "I50", "I47", "C47", "C47x", "I50m"] + [ktag(f) for f in KAL_F_TARGET] + ["K213b", "R50", "I50b"]
     else:
         soll = [t for t in TAGS
                 if (meta.get("music") or t not in ("P50", "P47", "C47", "C47x"))
@@ -969,16 +1028,28 @@ def analyse(cdir):
         c = load_cond(cdir, t)
         if c is None:
             checks.append(("%s: Bedingung vorhanden" % t, False)); continue
+        if mode == "target" and "defekt" not in c:
+            # Wiedergabe-Anteil aus der end0-Paketrate (Sampler, 1 s), nicht aus ALSA
+            r_ = c["rows"]; fl = []
+            for a_, b_ in zip(r_, r_[1:]):
+                dt_ = b_["t"] - a_["t"]
+                if dt_ > 0 and END0 in a_.get("np", {}) and END0 in b_.get("np", {}):
+                    fl.append((b_["np"][END0] - a_["np"][END0]) / dt_ > PLAY_PPS)
+            c["alsa_frac"] = 100.0 * sum(fl) / len(fl) if fl else float("nan"); c["modus"] = "target"
         C[t] = c
         M[t] = metrics(c) if "defekt" not in c else {}
         checks += checks_for(t, c, M[t], params)
     if not meta.get("music") and mode != "widerstand":
         S.append("HINWEIS: ohne Musik gemessen - kein P50/P47, Alias-Nachweis und Varianzanteile nicht moeglich.")
         L.append(S[-1])
-    if params:
+    if params and lan:
         S.append("Nachbildung: end0 %.1f Pak/s x %d B | %s %.1f Pak/s x %d B (TX-Ersatz fuer RX) | CPU %.1f Hz | %s" % (
             params["end0_hz"], params["end0_payload"], lan, params["lan_hz"], params["lan_payload"], params["cpu_hz"],
             params.get("quelle", "")))
+        L.append(S[-1])
+    elif params:
+        S.append("Target: Diretta-Empfang end0 %.1f Pak/s x %d B Rahmen (%s); Musikzustand aus end0-Paketrate (> %.0f Pak/s)" % (
+            params["end0_hz"], params.get("end0_rahmen_b", 0), params.get("quelle", ""), PLAY_PPS))
         L.append(S[-1])
     hdr = "Bed.  fs[Hz]  mean[V]  sd[mV] var>0,1Hz[mV2] mean-P0,1[mV] | rms 0,1-0,5 0,5-2 2-10 >10 Hz [mV] | ADEV 0,04/0,64/2,56 s [mV]"
     L.append(""); L.append(hdr); S.append(""); S.append(hdr)
@@ -1010,7 +1081,7 @@ def analyse(cdir):
         if params:
             fz = params["end0_hz"]
             cands = [("Diretta-Zyklus", fz, ("P50", "P47")), ("2x Zyklus", 2 * fz, ("P50", "P47")),
-                     ("1/2 Zyklus", fz / 2, ("P50", "P47")), (lan + "-Pakete", params["lan_hz"], ("P50", "P47"))]
+                     ("1/2 Zyklus", fz / 2, ("P50", "P47"))] + ([(lan + "-Pakete", params["lan_hz"], ("P50", "P47"))] if lan else [])
         cands += [("Netz 50 Hz", 50.0, ("I47", "P47")), ("Netz 100 Hz", 100.0, ("I47", "P47")), ("Netz 150 Hz", 150.0, ("I47", "P47")),
                   ("60 Hz", 60.0, ("I50", "I47", "P50", "P47")), ("120 Hz", 120.0, ("I50", "I47", "P50", "P47"))]
         for t, g_ in (("E50", "E"), ("E47", "E"), ("U50", "U"), ("C50", "C")):
@@ -1035,7 +1106,7 @@ def analyse(cdir):
             line = "  %-15s %7.2f Hz -> %s" % (name, fsrc, " | ".join(res) or "keine Daten")
             L.append(line); S.append(line)
         if params:
-            for name, f0 in (("Diretta-Zyklus", params["end0_hz"]), (lan + "-Pakete", params["lan_hz"])):
+            for name, f0 in [("Diretta-Zyklus", params["end0_hz"])] + ([(lan + "-Pakete", params["lan_hz"])] if lan else []):
                 ivs = source_search(M, f0)
                 fit_ = kal_fit(M, C)[1]
                 def corr(fq, rms):
@@ -1055,7 +1126,7 @@ def analyse(cdir):
         head = "Zusatzvarianz >0,1 Hz Wiedergabe (P50-I50): %.2f +- %.2f mV^2 (%.2f -> %.2f; +- = 1 Standardfehler)" % (
             vp - vi, math.hypot(ui, up), vi, vp)
         L.append(head); S.append(head)
-        rows = [("E50", "end0-Verkehr", None), ("U50", lan + "-TX-Ersatz", None), ("C50", "CPU-Wecker", None),
+        rows = [("E50", "end0-Verkehr", None), ("U50", str(lan) + "-TX-Ersatz", None), ("C50", "CPU-Wecker", None),
                 ("E50", "end0 ohne CPU-Anteil", "C50")]
         for t, lab, minus in rows:
             if t in M and "var_hf" in M[t] and vp > vi and (minus is None or minus in M):
@@ -1390,6 +1461,7 @@ def main():
     r = sp.add_parser("run"); r.add_argument("--dur", type=int, default=180); r.add_argument("--ohne-musik", action="store_true")
     r.add_argument("--kal-kurz", action="store_true", help="nur 2 Kalibrierfrequenzen (7,3 / 213 Hz) statt 6")
     w = sp.add_parser("widerstand"); w.add_argument("--dur", type=int, default=180)
+    tg = sp.add_parser("target"); tg.add_argument("--dur", type=int, default=180)
     sp.add_parser("status"); sp.add_parser("stop"); sp.add_parser("selftest")
     a = sp.add_parser("analyse"); a.add_argument("ordner")
     v = sp.add_parser("vergleich"); v.add_argument("a"); v.add_argument("b")
@@ -1415,8 +1487,8 @@ def main():
         if cur and H.alive(cur["pid"]):
             os.kill(cur["pid"], signal.SIGTERM); print("Abbruch gesendet."); return 0
         print("keine laufende Messung"); return 0
-    mode = "widerstand" if args.cmd == "widerstand" else "voll"
-    ohne = mode == "widerstand" or args.ohne_musik
+    mode = {"widerstand": "widerstand", "target": "target"}.get(args.cmd, "voll")
+    ohne = mode == "widerstand" or (mode == "voll" and args.ohne_musik)
     kurz = mode == "voll" and args.kal_kurz
     if args.dur < 60:
         print("--dur mindestens 60 s (Spektralaufloesung)"); return 2
@@ -1440,12 +1512,15 @@ def main():
     H.wjson(curp, {"dir": cdir, "pid": p.pid})
     if mode == "widerstand":
         n, nk, tot = 1, 0, args.dur + 30
+    elif mode == "target":
+        n, nk = 9, 4                        # P50 P47 I50 I47 C47 C47x I50m R50 I50b + K7 K113 K313 K213b
+        tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE + 6
     else:
         nk = 3 if kurz else 7
         n = 9 + (0 if ohne else 4)          # I50 I47 E50 E47 U50 C50 I50m R50 I50b (+ P50 P47 C47 C47x)
         tot = n * (args.dur + 25) + nk * (min(args.dur, KAL_DUR) + 25) + 2 * SETTLE_CHANGE + (0 if ohne else 6)
     print("%s gestartet: %d Bedingungen + %d Kalibrierungen, gesamt ca. %d min. Laeuft weiter, auch wenn die Verbindung abreisst." % (
-        "Widerstandsmessung" if mode == "widerstand" else "Versuchsreihe", n, nk, round(tot / 60)))
+        {"widerstand": "Widerstandsmessung", "target": "Target-Versuchsreihe"}.get(mode, "Versuchsreihe"), n, nk, round(tot / 60)))
     print("Fortschritt:  python3 vschwank.py status      Abbruch:  python3 vschwank.py stop\n")
     pos = 0
     try:

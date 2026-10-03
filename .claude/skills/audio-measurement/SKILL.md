@@ -21,6 +21,8 @@ Grundsaetze (verbindlich):
 | `~/ext5v/ext5v_run.sh` + `ext5v_stats.py` | EXT5V-Spannung 50 Hz, Logger auf CPU1 | `EXT5V_CPU=1 ./ext5v_run.sh 50 300 TAG` |
 | `hostmess.py` | Kampagne Ruhe/Wiedergabe/Laststufe + Systemaktivitaet (/proc) | `python3 hostmess.py run [--idle 0] [--step-mit-musik]` |
 | `vschwank.py` | Ursache der Schwankung: Alias-Test 50/47 Hz, Nachbildung end0/USB/CPU, Mechanismus CPU vs. Netz, Zuleitungswiderstand, Kalibrierung | `python3 vschwank.py run`, `widerstand`, `vergleich A B` |
+| `vschwank.py target` | dieselbe Ursachenanalyse am **Target** (Musikzustand aus end0-Empfangsrate) | `python3 vschwank.py target` |
+| `kernrausch.py` | Unterbrechungen/Thread-Aktivierungen je CPU (passiv, Musik aus/an) + osnoise/timerlat (nur Musik aus), ohne Zusatzpakete | `sudo python3 kernrausch.py run` |
 | `diagnose.sh` | Konfigurations-Bestandsaufnahme | `sudo bash diagnose.sh` |
 Ergebnisse: `~/ext5v/results/...` mit `SHA256SUMS`, Kurzbericht `kurz.txt`. Alle Werte in `Messprotokoll.md` uebernehmen.
 
@@ -56,6 +58,10 @@ sudo rtla osnoise top -c 2,3 -d 5m                  # Betriebssystem-Rauschen (U
 ```
 Auswertung: Max- und 99,9-%-Latenz je Kern; `osnoise` zeigt Anzahl/Dauer der Unterbrechungen nach Quelle
 (IRQ, Softirq, Thread). Vergleich immer Kern 2/3 gegen 0/1.
+
+**kernrausch.py** (v1.0) nutzt die Kernel-Tracer direkt ueber tracefs: osnoise (Kern-Rauschen je CPU + Quellen) und
+timerlat (Weck-Verzoegerung, Threads FIFO 95, 1000/s) - beide **nur bei gestoppter Musik**; alle tracefs-Einstellungen
+werden gesichert und auch bei Abbruch zurueckgesetzt (`sudo python3 kernrausch.py aufraeumen` als Notfall).
 
 ## 3. Wer unterbricht? (perf / ftrace)
 
