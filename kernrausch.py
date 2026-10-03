@@ -20,7 +20,7 @@ Ablauf (je Phase DAUER s, Standard 60):
 B und C laufen nur bei gestoppter Musik (die Tracer belegen die Kerne bzw. wecken sie 1000x/s mit FIFO 95).
 Musikzustand = end0-Paketrate (> 200 Pak/s), gilt auf Host und Target gleich.
 """
-import argparse, fcntl, glob, hashlib, json, math, os, pwd, re, select, shutil, signal, subprocess, sys, threading, time
+import argparse, errno, fcntl, glob, hashlib, json, math, os, pwd, re, select, shutil, signal, subprocess, sys, threading, time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,11 +41,13 @@ SETTLE_ON = float(os.environ.get("KR_SETTLE_ON", "60"))
 WAIT_MAX = float(os.environ.get("KR_WAIT", "1800"))
 OSN_PERIOD_US = 1000000                                       # Kernel-Standard: 1 s Periode, 1 s Laufzeit
 TL_PERIOD_US = 1000
-SAVE_KEYS = ("current_tracer", "tracing_on", "osnoise/cpus", "osnoise/period_us", "osnoise/runtime_us",
+SAVE_KEYS = ("current_tracer", "tracing_on", "osnoise/options", "osnoise/cpus", "osnoise/period_us", "osnoise/runtime_us",
              "osnoise/stop_tracing_us", "osnoise/stop_tracing_total_us", "osnoise/timerlat_period_us",
              "events/osnoise/enable", "events/osnoise/irq_noise/enable", "events/osnoise/softirq_noise/enable",
              "events/osnoise/thread_noise/enable", "events/osnoise/nmi_noise/enable")
 EVENT_KEYS = tuple(k for k in SAVE_KEYS if k.startswith("events/"))
+OPEN_PIPES = set()                       # nur Test: bildet die Kernel-Sperre nach (current_tracer bei offener trace_pipe)
+VORHER = os.path.join(SHM, "vorher.json")
 log = H.log
 
 
@@ -99,6 +101,9 @@ class Tracefs:
         return H.rd(os.path.join(self.root, key), None)
 
     def wr(self, key, val):
+        # Kernel: current_tracer laesst sich nicht wechseln, solange trace_pipe offen ist (EBUSY) - im Test nachgebildet
+        if TEST and key == "current_tracer" and OPEN_PIPES and str(val) != (self.rd(key) or "").strip():
+            raise OSError(errno.EBUSY, "Device or resource busy (trace_pipe offen)")
         with open(os.path.join(self.root, key), "w") as f:
             f.write(str(val))
 
@@ -117,7 +122,7 @@ class Tracefs:
         except OSError as e:
             errs.append("current_tracer: %s" % e)
         for k, v in self.saved.items():
-            if k == "current_tracer" or k in EVENT_KEYS or v is None:
+            if k in ("current_tracer", "osnoise/options") or k in EVENT_KEYS or v is None:
                 continue
             try:
                 self.wr(k, v)
@@ -130,6 +135,8 @@ class Tracefs:
             for k in EVENT_KEYS[1:]:
                 if self.saved.get(k) in ("0", "1"):
                     self.wr(k, self.saved[k])
+            if "NO_OSNOISE_WORKLOAD" in (self.saved.get("osnoise/options") or "").split():
+                self.wr("osnoise/options", "NO_OSNOISE_WORKLOAD")    # nur die eine von uns geaenderte Option
             if self.saved.get("current_tracer", "nop") != "nop":
                 self.wr("current_tracer", self.saved["current_tracer"])
         except OSError as e:
@@ -190,15 +197,17 @@ class PipeReader(threading.Thread):
     def __init__(self, path, coll):
         super().__init__(daemon=True)
         self.path, self.coll, self.stop_ev, self.err = path, coll, threading.Event(), None
+        self.abort_ev, self.opened = threading.Event(), threading.Event()
 
     def run(self):
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError as e:
-            self.err = str(e); return
+            self.err = str(e); self.opened.set(); return
+        OPEN_PIPES.add(fd); self.opened.set()
         buf = b""
         try:
-            while True:
+            while not self.abort_ev.is_set():
                 r, _, _ = select.select([fd], [], [], 0.2)
                 chunk = b""
                 if r:
@@ -218,7 +227,7 @@ class PipeReader(threading.Thread):
         finally:
             if buf:
                 self.coll.feed(buf.decode("utf-8", "replace"))
-            os.close(fd)
+            os.close(fd); OPEN_PIPES.discard(fd)
 
 
 # ------------------------------------------------------------------ passive Momentaufnahme
@@ -354,17 +363,21 @@ class Run:
                 tf.wr("osnoise/timerlat_period_us", TL_PERIOD_US)
                 if tf.rd("events/osnoise/enable") is not None:
                     tf.wr("events/osnoise/enable", "0")
+            if "NO_OSNOISE_WORKLOAD" in (tf.rd("osnoise/options") or "").split():
+                tf.wr("osnoise/options", "OSNOISE_WORKLOAD")      # sonst startet timerlat/osnoise keine Mess-Threads
             tf.wr("trace", "")                                  # Puffer leeren
             ov0 = tf.overruns(cpus)
             tf.wr("tracing_on", "1")
-            rd = PipeReader(os.path.join(tf.root, "trace_pipe"), coll); rd.start()
+            # Reihenfolge zwingend: erst Tracer setzen, DANN trace_pipe oeffnen (Kernel: EBUSY bei offener Pipe);
+            # die Zeilen bis zum Oeffnen bleiben im Ringpuffer und werden mitgelesen
             t0 = H.now_boot(); tf.wr("current_tracer", tracer)
+            self.reader = rd = PipeReader(os.path.join(tf.root, "trace_pipe"), coll); rd.start(); rd.opened.wait(5)
             time.sleep(1.0)
             r["threads"] = [{"comm": t["comm"], "cpu": t["cpu"], "policy": t["policy"], "rtprio": t["rtprio"]}
                             for t in tasks().values() if t["comm"].startswith(("osnoise/", "timerlat/"))]
             st = self.watch_state(False, max(0.0, self.dauer - 1.0), stop_on_change=True)
-            tf.wr("current_tracer", "nop"); t1 = H.now_boot()
-            time.sleep(0.5); rd.stop_ev.set(); rd.join(10)
+            tf.wr("tracing_on", "0"); t1 = H.now_boot()       # Aufzeichnung stoppen, Rest lesen, Pipe schliessen
+            rd.stop_ev.set(); rd.join(10)
             r.update({"dt": t1 - t0, "pps": st, "overrun": {c: (b - ov0[c]) if (b is not None and ov0[c] is not None) else None
                                                             for c, b in tf.overruns(cpus).items()},
                       "reader_err": rd.err, "zeilen": coll.lines, "unparsed": coll.unparsed, "lost": coll.lost,
@@ -379,16 +392,35 @@ class Run:
             else:
                 del r["fehler"]
         finally:
+            old = [signal.signal(sg, signal.SIG_IGN) for sg in (signal.SIGTERM, signal.SIGHUP)]   # Ruecksetzen nicht unterbrechen
+            self.close_reader()
             errs = tf.restore()
             if errs:
                 log("FEHLER beim Zuruecksetzen: %s" % errs)
             r["restore_err"] = errs
             r["nach"] = {k: (tf.rd(k) or "").strip() for k in ("current_tracer", "tracing_on")}
             self.data["phasen"][name] = r                       # auch bei Abbruch: Nachweis des Zuruecksetzens
+            for sg, h in zip((signal.SIGTERM, signal.SIGHUP), old):
+                signal.signal(sg, h)
         log("%s beendet: %d Zeilen, %d nicht erkannt, %d verloren" % (name, coll.lines, coll.unparsed, coll.lost))
+
+    def close_reader(self):
+        """trace_pipe muss zu sein, bevor current_tracer geaendert werden kann."""
+        rd = getattr(self, "reader", None)
+        if rd and rd.is_alive():
+            try:
+                self.tf.wr("tracing_on", "0")
+            except OSError:
+                pass
+            rd.stop_ev.set(); rd.join(3)
+            if rd.is_alive():
+                rd.abort_ev.set(); rd.join(3)
+        self.reader = None
 
     def run(self):
         self.data["vorher"] = self.tf.save() if self.tf else {}
+        if self.tf:                                             # dauerhaft sichern: aufraeumen auch nach kill -9
+            H.wjson(VORHER, {"tracefs": self.tf.root, "werte": self.data["vorher"]})
         self.wait(False)
         self.passive_phase("A_ruhe", False)
         if self.tf:
@@ -463,8 +495,10 @@ def checks(d):
                     len(r["restore_err"])), not r["restore_err"] and r["nach"].get("current_tracer") == d["vorher"].get(
                         "current_tracer", "nop")))
         out.append(("%s: Musik blieb aus" % n, bool(r.get("pps")) and all(p <= PLAY_PPS for p in r["pps"])))
-        out.append(("%s: Lesen ohne Fehler, keine verlorenen Ereignisse (verloren %d, Overrun %s)" % (n, r["lost"], r["overrun"]),
-                    not r["reader_err"] and r["lost"] == 0 and all(v in (0, None) for v in r["overrun"].values())))
+        ov = r["overrun"]; unk = [c for c, v in ov.items() if v is None]
+        out.append(("%s: Lesen ohne Fehler, keine verlorenen Ereignisse (verloren %d, Overrun %s%s)" % (
+                    n, r["lost"], {c: v for c, v in ov.items() if v is not None}, (", CPU %s nicht pruefbar" % unk) if unk else ""),
+                    not r["reader_err"] and r["lost"] == 0 and all(v == 0 for v in ov.values() if v is not None)))
         out.append(("%s: Zeilen erkannt (%d von %d, nicht erkannt <= 1 %%)" % (n, r["zeilen"] - r["unparsed"], r["zeilen"]),
                     r["zeilen"] > 0 and r["unparsed"] <= 0.01 * r["zeilen"]))
         if n == "B_osnoise":
@@ -582,6 +616,14 @@ def compare(a, b):
 
 
 # ------------------------------------------------------------------ Prozessrahmen
+def chown_tree_one(p):
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if uid and gid and os.geteuid() == 0:
+        try:
+            os.chown(p, int(uid), int(gid))
+        except OSError:
+            pass
+
 def chown_tree(p):
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if uid and gid and os.geteuid() == 0:
@@ -625,13 +667,25 @@ def child_main(cdir, dauer, lockfd):
     finally:
         signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN)
         if R.tf:
+            R.close_reader()
             cur = (R.tf.rd("current_tracer") or "").strip()
             if cur in ("osnoise", "timerlat"):          # Sicherheitsnetz, falls eine Phase mitten drin abbrach
                 log("Sicherheitsnetz: Tracer %s wird zurueckgesetzt: %s" % (cur, R.tf.restore() or "ok"))
+            if (R.tf.rd("current_tracer") or "").strip() == R.data.get("vorher", {}).get("current_tracer", "nop"):
+                try:
+                    os.unlink(VORHER)
+                except OSError:
+                    pass
     if not R.data["phasen"]:
         log("Keine Phase abgeschlossen - nichts gespeichert"); return rc or 1
-    dst = os.path.join(results_dir(), "kernrausch_" + os.path.basename(cdir) + ("" if done else "_ABGEBROCHEN"))
+    base = results_dir(); made = []
+    p_ = base
+    while p_ and not os.path.isdir(p_):
+        made.append(p_); p_ = os.path.dirname(p_)
+    dst = os.path.join(base, "kernrausch_" + os.path.basename(cdir) + ("" if done else "_ABGEBROCHEN"))
     os.makedirs(dst, exist_ok=True)
+    for m_ in made:                                     # neu angelegte Elternordner gehoeren dem Benutzer, nicht root
+        chown_tree_one(m_)
     H.wjson(os.path.join(dst, "data.json"), R.data)
     try:
         full, short = report(R.data)
@@ -662,11 +716,22 @@ def aufraeumen():
     curp = os.path.join(SHM, "current.json")
     if os.path.isfile(curp) and H.alive(H.rjson(curp)["pid"]):
         print("Messung laeuft noch - zuerst: sudo python3 kernrausch.py stop"); return 1
+    if os.path.isfile(VORHER):
+        v = H.rjson(VORHER); T.saved = v["werte"]
+        if T.saved.get("current_tracer") in ("osnoise", "timerlat"):
+            T.saved["current_tracer"] = "nop"
+        e = T.restore()
+        print("Alle gesicherten Tracer-Einstellungen wiederhergestellt%s (current_tracer jetzt: %s)" % (
+            (" - FEHLER: %s" % e) if e else "", (T.rd("current_tracer") or "").strip()))
+        if not e:
+            os.unlink(VORHER)
+        return 1 if e else 0
     if cur in ("osnoise", "timerlat"):
         T.wr("current_tracer", "nop")
         if T.rd("events/osnoise/enable") is not None:
             T.wr("events/osnoise/enable", "0")
-        print("Tracer %s zurueckgesetzt (jetzt: %s)" % (cur, (T.rd("current_tracer") or "").strip())); return 0
+        print("Tracer %s zurueckgesetzt (jetzt: %s); keine Sicherung gefunden, uebrige Werte unveraendert" % (
+            cur, (T.rd("current_tracer") or "").strip())); return 0
     print("nichts zu tun (current_tracer=%s)" % cur); return 0
 
 
