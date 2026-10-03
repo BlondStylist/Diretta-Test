@@ -31,7 +31,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.3"
+VERSION = "1.3.1"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -431,12 +431,12 @@ class Series:
         self.raw = os.path.join(cdir, "raw"); os.makedirs(self.raw, exist_ok=True)
         self.children, self.gen, self.params, self.state = [], None, {}, None
 
-    def wait_state(self, want):
+    def wait_state(self, want, settle=None):
         txt = "Musik STARTEN (96 kHz, Wiederholung an)" if want else "Musik STOPPEN"
         t_end = time.monotonic() + WAIT_MAX; ann = 0
         while True:
             if H.alsa_state()[0] == want:
-                settle = SETTLE_SAME if self.state == want else SETTLE_CHANGE
+                settle = settle if settle is not None else (SETTLE_SAME if self.state == want else SETTLE_CHANGE)
                 log("Zustand %s erkannt - %.0f s Beruhigung" % ("Wiedergabe" if want else "Ruhe", settle))
                 t_s = time.monotonic() + settle; ok = True
                 while time.monotonic() < t_s:
@@ -453,7 +453,7 @@ class Series:
                 raise SystemExit("Zeitueberschreitung beim Warten auf: " + txt)
             time.sleep(1.0)
 
-    def condition(self, tag, hz, want_play, gen=None, dur=None, pmic=False):
+    def condition(self, tag, hz, want_play, gen=None, dur=None, pmic=False, settle=None):
         only = os.environ.get("VS_ONLY")              # nur fuer Tests: Teilmenge der Bedingungen
         if only and tag not in only.split(","):
             return None
@@ -461,7 +461,7 @@ class Series:
         log("== %s: %s, %d Hz, %d s%s" % (tag, {True: "Wiedergabe", False: "Ruhe", None: "Musik egal"}[want_play], hz, dur,
                                          (", Last: " + gen[0]) if gen else ""))
         if want_play is not None:
-            self.wait_state(want_play)
+            self.wait_state(want_play, settle)
         cd = os.path.join(self.dir, tag); os.makedirs(cd, exist_ok=True)
         info = {"tag": tag, "hz": hz, "dur": dur, "want_play": want_play, "alsa_start": H.alsa_state()[1]}
         if gen:
@@ -582,7 +582,8 @@ class Series:
             self.condition(ktag(fk), 50, False, ("Rechteck CPU0 %g Hz" % fk, fk, "rechteck"), dur=min(self.dur, KAL_DUR))
         self.condition("K213b", 47, False, ("Rechteck CPU0 %.0f Hz" % KAL_HI, KAL_HI, "rechteck"), dur=min(self.dur, KAL_DUR))
         self.condition("R50", 50, False, ("Laststufe CPU0 %g Hz" % R_FREQ, R_FREQ, "rechteck"), pmic=True)
-        self.condition("I50b", 50, False)
+        # nach Laststufe laenger beruhigen (03.10.: I50b nach 15 s Varianz x1,44 gegenueber I50)
+        self.condition("I50b", 50, False, settle=SETTLE_CHANGE)
 
     def cleanup(self):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)   # zweites stop darf das Aufraeumen nicht unterbrechen
@@ -771,20 +772,27 @@ def metrics(c):
 def checks_for(tag, c, m, params):
     if "defekt" in c:
         return [("%s: Daten lesbar (%s)" % (tag, c["defekt"]), False)]
-    out = [("%s: logger_rc=0" % tag, c.get("rc") == 0 and not c.get("timeout") and c.get("logger_start") is not None),
-           ("%s: Daten vollstaendig (N=%d, Soll %d)" % (tag, m["n"], c["dur"] * c["hz"]), m["n"] >= 0.98 * c["dur"] * c["hz"]),
-           ("%s: Abtastrate %.3f Hz (Soll %d)" % (tag, m["fs"], c["hz"]), abs(m["fs"] - c["hz"]) < 0.01 * c["hz"]),
-           (("%s: Abtastung gleichmaessig (max dt %s ms, Luecken %d)" % (tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]),
-             c["dt_gaps"] == 0) if "pmic" not in c else
-            # R50 fragt parallel den PMIC ab; einzelne Luecken stoeren Halbperioden-Mittel nicht
-            ("%s: Abtastung ausreichend gleichmaessig trotz PMIC-Abfrage (max dt %s ms, Luecken %d <= 0,5 %%)" % (
-                tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]), c["dt_gaps"] <= 0.005 * m["n"] and c["dt_max"] < 0.2)),
+    out = [("%s: logger_rc=0" % tag, c.get("rc") == 0 and not c.get("timeout") and c.get("logger_start") is not None)]
+    if "pmic" not in c:
+        out += [("%s: Daten vollstaendig (N=%d, Soll %d)" % (tag, m["n"], c["dur"] * c["hz"]), m["n"] >= 0.98 * c["dur"] * c["hz"]),
+                ("%s: Abtastrate %.3f Hz (Soll %d)" % (tag, m["fs"], c["hz"]), abs(m["fs"] - c["hz"]) < 0.01 * c["hz"]),
+                ("%s: Abtastung gleichmaessig (max dt %s ms, Luecken %d)" % (tag, fmt(1000 * c["dt_max"], 1), c["dt_gaps"]),
+                 c["dt_gaps"] == 0)]
+    else:
+        # R50: jede PMIC-Abfrage blockiert den Logger kurz (gemeinsame Firmware-Schnittstelle, gemessen 03.10.: 1 Luecke
+        # je Abfrage, ~40 ms). Fuer Halbperioden-Mittel unschaedlich; geprueft wird, dass es nur daran liegt.
+        npm = len(c.get("pmic") or [])
+        out += [("%s: Daten ausreichend fuer Halbperioden-Mittel (N=%d, Soll %d, >= 90 %%)" % (tag, m["n"], c["dur"] * c["hz"]),
+                 m["n"] >= 0.90 * c["dur"] * c["hz"]),
+                ("%s: Luecken nur durch PMIC-Abfrage (%d Luecken bei %d Abfragen, max dt %s ms < 100)" % (
+                    tag, c["dt_gaps"], npm, fmt(1000 * c["dt_max"], 1)), c["dt_gaps"] <= npm + 3 and c["dt_max"] < 0.1)]
+    out += [
            (("%s: Wiedergabe %s (ist %.0f %%)" % (tag, "an" if c["want_play"] else "aus", c["alsa_frac"]),
              abs(c["alsa_frac"] - (100.0 if c["want_play"] else 0.0)) < 1e-9) if c["want_play"] is not None else
             ("%s: Musikzustand waehrend der Messung konstant (Wiedergabe %.0f %%)" % (tag, c["alsa_frac"]),
              c["alsa_frac"] in (0.0, 100.0))),
-           ("%s: keine Unterspannung/Drosselung" % tag, m.get("thr_ok", False)),
-           ("%s: Sampler ohne Fehler" % tag, c.get("sampler_err") is None)]
+            ("%s: keine Unterspannung/Drosselung" % tag, m.get("thr_ok", False)),
+            ("%s: Sampler ohne Fehler" % tag, c.get("sampler_err") is None)]
     if c["want_play"] or (c["want_play"] is None and c["alsa_frac"] == 100.0):
         out.append(("%s: Abtastrate Musik konstant %s" % (tag, c["rates"]), len(c["rates"]) == 1))
     g = c.get("gen")

@@ -104,3 +104,26 @@ Befunde:
 - Einschraenkung: E50/C50 bei 500,04 Hz falten bei 50-Hz-Abtastung auf 0,04 Hz -> Schwebung im Band 0,1-0,5 Hz
   (2,78/3,49 mV gegen 0,33 mV Ruhe) blaeht deren Anteile auf (end0 73±19 %, CPU 88±43 %). Aussagekraeftig ist der 47-Hz-Vergleich.
 - enu1 (305,6 Pak/s): keine Spitze; USB-Sendelast als Ersatz ~50±3 % Varianzanteil (breitbandig, keine Linie).
+
+## Mechanismus und Zuleitungswiderstand (vschwank.py 1.3, Host, 03.10.2026 10:07, 162/167 Pruefungen)
+
+Kalibrierung: H = 0,98-1,00 (3,1-313 Hz), T = 0,35 ms (H(500 Hz) 0,95 Modell), Lastempfindlichkeit 24,9 mV/Kern. Drift: I50 4966,910 /
+I50m 4967,039 / I50b 4966,573 mV (36,0-36,7 °C).
+
+| Groesse | Wert |
+|---|---|
+| Diretta-Zyklus (Quellsuche) | 499,93-500,11 Hz, end0 500,0 Pak/s × 1513 B |
+| Linie 500 Hz in P47 | 1,58 ± 0,07 mV rms (×29 Ruhe) |
+| Linie 1000 Hz in P47 | 2,20 ± 0,05 mV rms (×27 Ruhe) |
+| Diretta-Rechenzeit je Zyklus (P50−I50, schedstat) | +28,4 µs (gesamt 30,6 µs) |
+| C47 (CPU0-Wecker 28,4 µs) | 0,50 ± 0,03 mV (erwartet aus C47x 0,56 → linear) |
+| C47x Positivkontrolle (199,8 µs) | 3,87 ± 0,04 mV (×174 Ruhe) |
+| **Prozessor-Anteil an der 500-Hz-Linie** | **35 ± 2 %** (Rest Netzwerk-Hardware; E47: Hardware ~1,22 mV ≈ 77 %) |
+| R50 Spannungshub je Kern | 24,46 ± 0,05 mV (Gegenprobe Kalibrierung ×0,98) |
+| R50 Leistungshub PMIC-Schienen | 0,821 ± 0,005 W |
+| **Zuleitungswiderstand Host (Tomanek + Kabel + Stecker + Pi-Eingang)** | **129 mΩ** (118-140 mΩ für Wirkungsgrad 95-80 %) |
+
+FAIL-Pruefungen: I47 3 Abtastluecken (max 47 ms); R50 Vollstaendigkeit/Rate/Luecken (Ursache: jede PMIC-Abfrage blockiert den
+Logger ~40 ms, 360 Luecken bei 360 Abfragen; fuer Halbperioden-Mittel unschaedlich -> Pruefung in 1.3.1 angepasst);
+Ruhe I50b/I50 Varianz ×1,44 (I50b nur 15 s nach der Laststufe R50 -> 1.3.1 beruhigt 60 s).
+Varianzanteile @50 Hz (E50/C50) weiter durch Schwebung 0,05 Hz verfaelscht - nicht verwenden; 60-Hz-„SPITZE“ in P47 = 1000-Hz-Alias.
