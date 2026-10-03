@@ -34,7 +34,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -207,7 +207,14 @@ def kal_response(M, C):
         fa = alias(fk, M[t]["fs"]); a = peak_rms(M[t], fa); se, nb = line_se(M[t], fa)
         rr, _ = excess(M[t], M.get("I47" if t == "K213b" else "I50"), fa, 0.15)
         g = (C.get(t) or {}).get("gen") or {}
-        c = g.get("grund_rms", float("nan")); src = "Last an Logger-Zeitpunkten"
+        cb, ca, ps = g.get("grund_rms_bloecke", float("nan")), g.get("grund_rms_abgetastet", float("nan")), g.get("phasenspruenge")
+        c, src = float("nan"), ""
+        if math.isfinite(cb) and (ps or 0) <= 2:
+            c, src = cb, "Schaltzeiten, blockweise"            # Hauptweg: unabhaengig von Logger-Zeitstempeln
+        elif math.isfinite(ca):
+            c, src = ca, "Last an Logger-Zeitpunkten (%s Phasenspruenge)" % ps
+        elif math.isfinite(g.get("grund_rms", float("nan"))):
+            c, src = g["grund_rms"], "Schaltzeiten"            # 1.4.2/1.4.3-Laeufe
         if not math.isfinite(c):
             d = g.get("tastverhaeltnis", float("nan"))
             c = math.sqrt(2) / math.pi * math.sin(math.pi * d) if math.isfinite(d) and 0.05 < d < 0.95 else SQ_FUND
@@ -215,6 +222,7 @@ def kal_response(M, C):
         gen_ok = c >= 0.2 * SQ_FUND        # Taktspruenge sind in c enthalten; nur zu schwache Last ist unbrauchbar
         sig = gen_ok and rr >= 4 and math.isfinite(a) and (a >= T995[nb - 1] * se if math.isfinite(se) else True)
         rows.append({"tag": t, "f": fk, "fa": fa, "a": a, "se": se, "rr": rr, "c": c, "src": src, "sig": sig, "gen_ok": gen_ok,
+                     "c_b": cb, "c_a": ca,
                      "spr": g.get("taktspruenge"), "dtsd": C[t].get("dt_sd_ms") if t in C else None,
                      "d": g.get("tastverhaeltnis", float("nan"))})
     if ref is None:                           # ohne R50: tiefste signifikante Stuetzstelle als Bezug (als solcher markiert)
@@ -292,9 +300,9 @@ def adev(v, fs, taus=(0.04, 0.16, 0.64, 2.56, 10.24)):
 # ------------------------------------------------------------------ Lastgeneratoren (Thread, CPU0)
 class Pacer(threading.Thread):
     """ruft fn() mit fester Rate auf; protokolliert Anzahl, Fehler und Verspaetung."""
-    def __init__(self, rate, fn, name):
+    def __init__(self, rate, fn, name, max_lag=3):
         super().__init__(daemon=True)
-        self.rate, self.fn, self.label = rate, fn, name
+        self.rate, self.fn, self.label, self.max_lag = rate, fn, name, max_lag
         self.stop_ev = threading.Event(); self.n = 0; self.err = 0; self.late = []; self.t0 = self.t1 = None
 
     def run(self):
@@ -314,7 +322,7 @@ class Pacer(threading.Thread):
                 self.err += 1
             self.n += 1
             nxt += per
-            if time.monotonic() - nxt > 3 * per:  # mehr als 3 Perioden zurueck: Takt neu aufsetzen, nicht buendeln
+            if time.monotonic() - nxt > self.max_lag * per:  # zu weit zurueck: Takt neu aufsetzen (Phasensprung), nicht buendeln
                 nxt = time.monotonic(); self.resync = getattr(self, "resync", 0) + 1
         self.t1 = H.now_boot(); self.cpu_s = time.thread_time() - c0   # Rechenzeit dieses Threads (Nutzer + Kern)
 
@@ -362,7 +370,9 @@ class SquareGen(threading.Thread):
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.2)
         c0, w0 = self._cpu(), time.monotonic()
-        self.pacer = Pacer(2 * self.freq, self._toggle, self.label); self.pacer.start()
+        # Rechteck: Verspaetungen werden nachgeholt statt neu aufgesetzt -> Phase bleibt am Sollraster (wichtig fuer die
+        # Grundwellen-Bestimmung); Neuaufsetzen nur nach > 100 ms Stillstand (dann als Phasensprung gezaehlt)
+        self.pacer = Pacer(2 * self.freq, self._toggle, self.label, max_lag=max(3, 0.1 * 2 * self.freq)); self.pacer.start()
         self.stop_ev.wait()
         self.pacer.stop_ev.set(); self.pacer.join(5)
         self.duty = (self._cpu() - c0) / (time.monotonic() - w0)   # gemessener Anteil "Last an" (Rechenzeit / Wandzeit)
@@ -635,8 +645,9 @@ class Series:
             if isinstance(self.gen, SquareGen) and self.gen.freq > 1.0 and lstart is not None and runs:
                 vt = [lstart + t_ for t_, _ in H.load_voltage(runs[-1], 0.0)]
                 rms_, j_, nb_ = self.gen.window_fund(lstart, lstart + dur, NSEG / hz)
-                self.gen.fenster = {"grund_rms": sampled_fund(self.gen.ts, self.gen.freq, vt), "grund_rms_bloecke": rms_,
-                                    "taktspruenge": j_, "grund_bloecke": nb_}
+                self.gen.fenster = {"grund_rms_bloecke": rms_, "grund_rms_abgetastet": sampled_fund(self.gen.ts, self.gen.freq, vt),
+                                    "verspaetungen": j_, "grund_bloecke": nb_,
+                                    "phasenspruenge": getattr(self.gen.pacer, "resync", 0) if self.gen.pacer else None}
             info["gen"] = self.gen.stats(); self.gen = None
         info.update({"rc": p.returncode, "run_dir": os.path.relpath(runs[-1], self.dir) if runs else None,
                      "alsa_end": H.alsa_state()[1], "c0": c0, "c1": c1, "sampler_err": smp.err})
@@ -993,12 +1004,13 @@ def checks_for(tag, c, m, params):
                         g["verzug_p99_ms"] < 2.0 if "rechteck_hz" not in g else
                         # Rechteck: Last an den Logger-Zeitpunkten bekannt -> Taktfehler werden herausgerechnet; gefordert ist
                         # nur eine ausreichende Grundwelle (>= 20 % des idealen Rechtecks); Altlaeufe: Verzug < 25 % Halbperiode
-                        (g["grund_rms"] >= 0.2 * SQ_FUND if math.isfinite(g.get("grund_rms", float("nan")))
+                        (g.get("grund_rms_bloecke", g.get("grund_rms", 0)) >= 0.2 * SQ_FUND
+                         if math.isfinite(g.get("grund_rms_bloecke", g.get("grund_rms", float("nan"))))
                          else g["verzug_p99_ms"] < 0.25 * 1000.0 / g["soll_hz"]) or g["rechteck_hz"] <= 1.0)))
-        if "rechteck_hz" in g and g["rechteck_hz"] > 1.0 and math.isfinite(g.get("grund_rms", float("nan"))):
-            out.append(("%s: Last-Grundwelle an Logger-Zeitpunkten %.3f (ideal 0,450; blockweise %s), Taktspruenge %d, Tastv. Rechenzeit %s %%" % (
-                tag, g["grund_rms"], fmt(g.get("grund_rms_bloecke"), 3), g.get("taktspruenge", 0),
-                fmt(100 * g.get("tastverhaeltnis", float("nan")), 0)), g["grund_rms"] >= 0.2 * SQ_FUND))
+        if "rechteck_hz" in g and g["rechteck_hz"] > 1.0 and math.isfinite(g.get("grund_rms_bloecke", float("nan"))):
+            out.append(("%s: Last-Grundwelle %.3f (ideal 0,450; an Logger-Zeitpunkten %s), Phasenspruenge %s (<= 2), Verspaetungen %d, Tastv. %s %%" % (
+                tag, g["grund_rms_bloecke"], fmt(g.get("grund_rms_abgetastet"), 3), g.get("phasenspruenge"), g.get("verspaetungen", 0),
+                fmt(100 * g.get("tastverhaeltnis", float("nan")), 0)), g["grund_rms_bloecke"] >= 0.2 * SQ_FUND and (g.get("phasenspruenge") or 0) <= 2))
         iface = {"E": params.get("end0_if", END0), "U": params.get("lan_if", LAN)}.get(tag[0])
         if iface and "net" in m:
             tx = m["net"].get(iface, {}).get("txp", 0.0)
@@ -1309,6 +1321,14 @@ def analyse(cdir):
                 "" if r["sig"] else ("  (Last zu schwach - nicht verwendet)" if not r["gen_ok"]
                                      else "  (nicht signifikant)"))
             L.append(line); S.append(line)
+        both_ = [r for r in krows if math.isfinite(r["c_b"]) and math.isfinite(r["c_a"]) and r["c_a"] > 0]
+        if both_:
+            line = "  Gegenprobe Last-Grundwelle (blockweise / an Logger-Zeitpunkten): " + "; ".join(
+                "%s %.3f/%.3f" % (r["tag"], r["c_b"], r["c_a"]) for r in both_)
+            L.append(line)
+            dis = [r["tag"] for r in both_ if r["f"] <= 313 and abs(r["c_b"] / r["c_a"] - 1) > 0.10]
+            checks.append(("Kalibrierung: beide Last-Bestimmungen stimmen bis 313 Hz ueberein (<= 10 %%)%s" % (
+                (" - abweichend: %s" % dis) if dis else ""), not dis))
         if kref:
             line = "  Bezug (Gleichstrom): %s, Hub %.2f +- %.2f mV je voll belastetem Kern%s" % (
                 kref["quelle"], kref["hub"], kref["se"], " = Kalibrierung 2 (Lastempfindlichkeit)")
