@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vschwank.py v1.3 - Ursachenanalyse der Spannungsschwankung bei Wiedergabe (Diretta-Host, Raspberry Pi 5).
+"""vschwank.py v1.4 - Ursachenanalyse der Spannungsschwankung bei Wiedergabe (Diretta-Host, Raspberry Pi 5).
 
 Benoetigt hostmess.py im selben Verzeichnis (gemeinsame, getestete Mess-Bausteine). Nur Standardbibliothek,
 kein sudo, aendert keine Konfiguration.
@@ -21,11 +21,12 @@ Versuchsplan (je Bedingung DUR s, Standard 180 s):
              C47/C47x CPU-Weckrhythmus @47 Hz: Rechenzeit je Zyklus wie Diretta (gemessen P50-I50) bzw. ~10 % Tastverh.
                       (Positivkontrolle) -> Anteil Prozessor an der 500-Hz-Linie
              R50      Laststufe 10 s an / 10 s aus + PMIC-Strommessung -> Widerstand Netzteil+Kabel+Stecker
-             K7/K213/K213b Kalibrierung der Messkette (Rechtecklast CPU0 7,3 Hz und 213 Hz @50/@47)
+             K3..K1013/K213b Frequenzgang Sensor x Versorgung bis 1013 Hz (Rechtecklast CPU0; Grundwelle aus Schaltzeiten,
+                      Bezug = Gleichstrom-Laststufe R50)
              I50b Ruhe-Wiederholung (Stabilitaet)
 Auswertung: Statistik, Spektrum (Welch), Allan-Abweichung, Alias-Vorhersage, Varianzanteile, Aktivitaet.
 """
-import argparse, cmath, fcntl, glob, hashlib, math, os, re, shutil, signal, socket, subprocess, sys, threading, time, traceback
+import argparse, bisect, cmath, fcntl, glob, hashlib, math, os, re, shutil, signal, socket, subprocess, sys, threading, time, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -33,7 +34,7 @@ try:
 except ImportError:
     sys.exit("hostmess.py fehlt im selben Verzeichnis wie vschwank.py")
 
-VERSION = "1.4.2"
+VERSION = "1.4.4"
 SHM = os.environ.get("VS_SHM", "/dev/shm/vschwank")
 RESULTS = os.environ.get("VS_RESULTS", os.path.join(H.EXT5V, "results"))
 END0 = os.environ.get("VS_END0", "end0")
@@ -47,7 +48,7 @@ NSEG = 512                                                   # Welch-Segment (Po
 BANDS = ((0.09, 0.5), (0.5, 2.0), (2.0, 10.0), (10.0, 1e9))   # unterstes Band ab 1. Bin (0,098 Hz)
 KAL_LO, KAL_HI = 7.3, 213.0                                     # Kalibrierfrequenzen (Alias 213 Hz: 13 Hz @50, 22 Hz @47)
 KAL_F = (3.1, 7.3, 31.0, 113.0, 213.0, 313.0, 513.0, 1013.0)     # Frequenzgang bis ueber Diretta-Takt/1. Oberwelle (Alias @50:
-                                                                #  3,1/7,3/19/13/13/13/13/13 Hz; @47: 513 -> 4, 1013 -> 21 Hz)
+                                                                #  3,1/7,3/19/13/13/13/13/13 Hz; K213b @47: 22 Hz)
 KAL_KURZ = (7.3, 213.0, 513.0, 1013.0)
 KAL_DUR = 120                                                   # Dauer je Kalibrierbedingung [s]
 SQ_FUND = 2 * math.sqrt(2) / math.pi / 2                        # rms der Grundwelle eines Rechtecks je Volt Hub (0,4502)
@@ -57,7 +58,7 @@ R_SKIP = 2.0                                                    # je Halbperiode
 PMIC_DT = 0.5                                                   # PMIC-Abfrage R50 [s]
 ETA = (0.80, 0.875, 0.95)                                       # Wirkungsgrad PMIC-Wandler (Annahme, Spanne)
 MECH_DUTY = 0.10                                                # C47x: Tastverhaeltnis der Positivkontrolle
-KAL_F_TARGET = (7.3, 31.0, 113.0, 313.0, 513.0, 1013.0)          # Target: 6 Stuetzstellen (+ K213b als Gegenprobe)
+KAL_F_TARGET = (7.3, 31.0, 113.0, 213.0, 313.0, 513.0, 1013.0)   # Target: 7 Stuetzstellen (+ K213b als 47-Hz-Gegenprobe)
 PLAY_PPS = float(os.environ.get("VS_PLAY_PPS", "200"))          # Target: Wiedergabe = end0 rx+tx > 200 Pak/s
 log = H.log
 
@@ -206,13 +207,15 @@ def kal_response(M, C):
         fa = alias(fk, M[t]["fs"]); a = peak_rms(M[t], fa); se, nb = line_se(M[t], fa)
         rr, _ = excess(M[t], M.get("I47" if t == "K213b" else "I50"), fa, 0.15)
         g = (C.get(t) or {}).get("gen") or {}
-        c = g.get("grund_rms", float("nan")); src = "Schaltzeiten"
+        c = g.get("grund_rms", float("nan")); src = "Last an Logger-Zeitpunkten"
         if not math.isfinite(c):
             d = g.get("tastverhaeltnis", float("nan"))
             c = math.sqrt(2) / math.pi * math.sin(math.pi * d) if math.isfinite(d) and 0.05 < d < 0.95 else SQ_FUND
             src = "Tastverhaeltnis" if math.isfinite(d) else "Annahme 50 %"
-        sig = rr >= 4 and math.isfinite(a) and (a >= T995[nb - 1] * se if math.isfinite(se) else True)
-        rows.append({"tag": t, "f": fk, "fa": fa, "a": a, "se": se, "rr": rr, "c": c, "src": src, "sig": sig,
+        gen_ok = c >= 0.2 * SQ_FUND        # Taktspruenge sind in c enthalten; nur zu schwache Last ist unbrauchbar
+        sig = gen_ok and rr >= 4 and math.isfinite(a) and (a >= T995[nb - 1] * se if math.isfinite(se) else True)
+        rows.append({"tag": t, "f": fk, "fa": fa, "a": a, "se": se, "rr": rr, "c": c, "src": src, "sig": sig, "gen_ok": gen_ok,
+                     "spr": g.get("taktspruenge"), "dtsd": C[t].get("dt_sd_ms") if t in C else None,
                      "d": g.get("tastverhaeltnis", float("nan"))})
     if ref is None:                           # ohne R50: tiefste signifikante Stuetzstelle als Bezug (als solcher markiert)
         low = next((r for r in sorted(rows, key=lambda r: r["f"]) if r["sig"]), None)
@@ -331,22 +334,23 @@ class SquareGen(threading.Thread):
         super().__init__(daemon=True)
         self.freq, self.label, self.stop_ev, self.pacer, self.proc, self.on = freq, label, threading.Event(), None, None, True
         self.toggles = []
-        self.fsum, self.on_t, self.t_first, self.t_last, self.n_on = 0j, None, None, None, 0
+        self.ts = []                 # (BOOTTIME, Last an?) jedes Schaltvorgangs; nur im Speicher, Auswertung im Logger-Fenster
 
     def _toggle(self):
-        off = self.on
-        os.kill(self.proc.pid, signal.SIGSTOP if self.on else signal.SIGCONT); t = time.monotonic(); self.on = not self.on
+        if self.on:                                   # aus: erst stoppen, dann Zeit (Last laeuft bis hierher)
+            os.kill(self.proc.pid, signal.SIGSTOP); t = H.now_boot()
+        else:                                         # an: Zeit, dann fortsetzen
+            t = H.now_boot(); os.kill(self.proc.pid, signal.SIGCONT)
+        self.on = not self.on
+        self.ts.append((t, self.on))
         if self.freq <= 1.0:
-            self.toggles.append((H.now_boot(), self.on))  # (Zeit, Last an?) fuer R50 (wenige Eintraege)
-        # Grundwelle der TATSAECHLICH geschalteten Last: Fourier-Koeffizient der An-Intervalle bei freq (exakt, ohne Annahme
-        # ueber Tastverhaeltnis oder Taktgenauigkeit)
-        if self.t_first is None:
-            self.t_first = t
-        self.t_last = t
-        if off and self.on_t is not None:
-            self.fsum += onoff_seg(self.on_t, t, self.freq); self.n_on += 1
-        elif not off:
-            self.on_t = t
+            self.toggles.append((t, self.on))         # (Zeit, Last an?) fuer R50 (wenige Eintraege, wird gespeichert)
+
+    def window_fund(self, t0, t1, block):
+        """Grundwelle der TATSAECHLICH geschalteten Last im Fenster [t0, t1], blockweise wie die Welch-Mittelung der
+        Spannung: rms_k je Block (Fourier-Koeffizient bei freq), Ergebnis sqrt(mean rms_k^2). Taktspruenge (Luecke > 3
+        Perioden) werden gezaehlt. -> (rms, Taktspruenge, Bloecke)"""
+        return window_fund(self.ts, self.freq, t0, t1, block)
 
     def _cpu(self):
         st = H.parse_task_stat(H.rd("/proc/%d/stat" % self.proc.pid))
@@ -374,8 +378,49 @@ class SquareGen(threading.Thread):
         st["rechteck_hz"] = self.freq
         st["tastverhaeltnis"] = getattr(self, "duty", float("nan"))
         st["toggles"] = list(self.toggles)
-        st["grund_rms"] = onoff_rms(self.fsum, self.t_first, self.t_last) if self.n_on >= 10 else float("nan")
+        st.update(getattr(self, "fenster", {}))
         return st
+
+def load_at(ts, times, initial=True):
+    """Zustand der Last (0/1) zu jedem Zeitpunkt aus den Schaltzeiten."""
+    tt = [t for t, _ in ts]; out = []
+    for t in times:
+        k = bisect.bisect_right(tt, t) - 1
+        out.append(1.0 if (ts[k][1] if k >= 0 else initial) else 0.0)
+    return out
+
+def sampled_fund(ts, f, times):
+    """Grundwelle der tatsaechlich geschalteten Last, abgetastet zu den ECHTEN Logger-Zeitpunkten und mit derselben
+    Welch/peak_rms-Kette ausgewertet wie die Spannung: Taktspruenge, Frequenzabweichung, Faltung und Abtast-Streuung
+    wirken auf beide Seiten gleich. -> rms je Einheit Hub am Alias"""
+    if len(times) < NSEG + 2 or len(ts) < 4:
+        return float("nan")
+    x = load_at(ts, times)
+    fs = (len(times) - 1) / (times[-1] - times[0])
+    fq, p = welch(x, fs)
+    return peak_rms({"f": fq, "psd": p}, alias(f, fs))
+
+def window_fund(ts, f, t0, t1, block):
+    nb = int((t1 - t0) // block) if t1 > t0 else 0
+    if nb < 1 or len(ts) < 4:
+        return float("nan"), 0, 0
+    sums = [0j] * nb; on_t = None; jumps = 0; per = 1.0 / f; prev = None
+    for t, on in ts:
+        if prev is not None and t0 <= t <= t1 and t - prev > 3 * per / 2:   # Schaltabstand Soll = halbe Periode
+            jumps += 1
+        prev = t
+        if on:
+            on_t = t; continue
+        if on_t is None:
+            continue
+        a, b = max(on_t, t0), min(t, t1); on_t = None
+        if b <= a:
+            continue
+        k = int(((a + b) / 2 - t0) // block)
+        if 0 <= k < nb:
+            sums[k] += onoff_seg(a - t0, b - t0, f)
+    rms = [abs(2 * z / block) / math.sqrt(2) for z in sums]
+    return math.sqrt(sum(x * x for x in rms) / nb), jumps, nb
 
 def onoff_seg(a, b, f):
     """Integral von exp(-i 2 pi f t) ueber ein An-Intervall [a, b]."""
@@ -583,11 +628,16 @@ class Series:
             info["pmic"] = pm.rows; info["pmic_err"] = pm.err
         c1 = counters()
         smp.stop_ev.set(); smp.join(10)
-        if self.gen:
-            self.gen.stop_ev.set(); self.gen.join(10)
-            info["gen"] = self.gen.stats(); self.gen = None
         out = H.rd(outp)
         runs = [l for l in out.splitlines() if l.startswith(self.raw)]
+        if self.gen:
+            self.gen.stop_ev.set(); self.gen.join(10)
+            if isinstance(self.gen, SquareGen) and self.gen.freq > 1.0 and lstart is not None and runs:
+                vt = [lstart + t_ for t_, _ in H.load_voltage(runs[-1], 0.0)]
+                rms_, j_, nb_ = self.gen.window_fund(lstart, lstart + dur, NSEG / hz)
+                self.gen.fenster = {"grund_rms": sampled_fund(self.gen.ts, self.gen.freq, vt), "grund_rms_bloecke": rms_,
+                                    "taktspruenge": j_, "grund_bloecke": nb_}
+            info["gen"] = self.gen.stats(); self.gen = None
         info.update({"rc": p.returncode, "run_dir": os.path.relpath(runs[-1], self.dir) if runs else None,
                      "alsa_end": H.alsa_state()[1], "c0": c0, "c1": c1, "sampler_err": smp.err})
         H.wjson(os.path.join(cd, "cond.json"), info)
@@ -865,6 +915,7 @@ def load_cond(cdir, tag):
     dts = [b - a for a, b in zip(t, t[1:])]
     al = [r["alsa"] for r in smp]
     info.update({"v": v, "t": t, "fs": fs, "dt_max": max(dts) if dts else float("nan"),
+                 "dt_sd_ms": 1000 * H.sdev(dts) if len(dts) > 2 else float("nan"),
                  "dt_gaps": sum(1 for d in dts if d > 1.5 / info["hz"]),
                  "alsa_frac": 100.0 * sum(al) / len(al) if al else float("nan"),
                  "rates": sorted({r["rate"] for r in smp if r.get("rate")}), "rows": smp})
@@ -940,13 +991,14 @@ def checks_for(tag, c, m, params):
                     g["fehler"]),
                     abs(g["n"] - soll_n) <= max(1.5, 0.02 * soll_n) and g["fehler"] == 0 and (
                         g["verzug_p99_ms"] < 2.0 if "rechteck_hz" not in g else
-                        # Rechteck: Grundwelle aus Schaltzeiten bekannt -> Taktfehler werden herausgerechnet; gefordert ist
-                        # nur eine kraeftige Grundwelle (>= 40 % des idealen Rechtecks); Altlaeufe: Verzug < 25 % Halbperiode
-                        (g["grund_rms"] >= 0.4 * SQ_FUND if math.isfinite(g.get("grund_rms", float("nan")))
+                        # Rechteck: Last an den Logger-Zeitpunkten bekannt -> Taktfehler werden herausgerechnet; gefordert ist
+                        # nur eine ausreichende Grundwelle (>= 20 % des idealen Rechtecks); Altlaeufe: Verzug < 25 % Halbperiode
+                        (g["grund_rms"] >= 0.2 * SQ_FUND if math.isfinite(g.get("grund_rms", float("nan")))
                          else g["verzug_p99_ms"] < 0.25 * 1000.0 / g["soll_hz"]) or g["rechteck_hz"] <= 1.0)))
         if "rechteck_hz" in g and g["rechteck_hz"] > 1.0 and math.isfinite(g.get("grund_rms", float("nan"))):
-            out.append(("%s: Grundwelle der Last %.3f (ideal 0,450), Tastverhaeltnis Rechenzeit %s %%" % (
-                tag, g["grund_rms"], fmt(100 * g.get("tastverhaeltnis", float("nan")), 0)), g["grund_rms"] >= 0.4 * SQ_FUND))
+            out.append(("%s: Last-Grundwelle an Logger-Zeitpunkten %.3f (ideal 0,450; blockweise %s), Taktspruenge %d, Tastv. Rechenzeit %s %%" % (
+                tag, g["grund_rms"], fmt(g.get("grund_rms_bloecke"), 3), g.get("taktspruenge", 0),
+                fmt(100 * g.get("tastverhaeltnis", float("nan")), 0)), g["grund_rms"] >= 0.2 * SQ_FUND))
         iface = {"E": params.get("end0_if", END0), "U": params.get("lan_if", LAN)}.get(tag[0])
         if iface and "net" in m:
             tx = m["net"].get(iface, {}).get("txp", 0.0)
@@ -1104,12 +1156,12 @@ def analyse(cdir):
     C, M = {}, {}
     mode = meta.get("modus", "voll")
     vt = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3]) + (0, 0, 0)
-    v13 = vt[:2] >= (1, 3); v14 = vt[:3] >= (1, 4, 2)
+    v13 = vt[:2] >= (1, 3); v14 = vt[:3] >= (1, 4, 4)
     if mode == "widerstand":
         soll = ["R50"]
     elif mode == "target":
         soll = ["P50", "P47", "I50", "I47", "C47", "C47x", "I50m"] + [ktag(f) for f in KAL_F_TARGET
-                                                                         if v14 or f not in (513.0, 1013.0)] + ["K213b", "R50", "I50b"]
+                                                                         if v14 or f not in (213.0, 513.0, 1013.0)] + ["K213b", "R50", "I50b"]
     else:
         soll = [t for t in TAGS
                 if (meta.get("music") or t not in ("P50", "P47", "C47", "C47x"))
@@ -1214,7 +1266,8 @@ def analyse(cdir):
                     hq = resp_at(krows_, fq)
                     if hq is None:
                         return ", Antwort bei %.0f Hz nicht gemessen" % fq
-                    return ", auf Gleichstrom-Bezug umgerechnet %s mV (Antwort %.2f gemessen)" % (fmt(rms / hq), hq) if hq >= 0.2 else ""
+                    return (", auf Gleichstrom-Bezug umgerechnet %s mV (Antwort %.2f gemessen)" % (fmt(rms / hq), hq) if hq >= 0.2
+                            else ", Antwort %.2f < 0,2 - nicht umgerechnet" % hq)
                 line = "  Quellsuche %s +-25 Hz (Spitze in P47 und P50, oder P50 blind): %s" % (name, "; ".join(
                     "%.2f-%.2f Hz (Alias %.2f/%.2f Hz, rms %s/%.2f mV%s%s)" % (a, b, h[1], h[2], fmt(h[3]), h[4],
                     ", P50 blind" if math.isnan(h[3]) else "", corr(h[0], h[4])) for a, b, h in ivs) or "kein Treffer")
@@ -1250,9 +1303,11 @@ def analyse(cdir):
         for r in sorted(krows, key=lambda r: (r["f"], r["tag"])):
             z = (1000 * rdc[ETA[1]] * r["resp"]) if rdc.get(ETA[1]) and "resp" in r else float("nan")
             line = "  %-6s %6.1f Hz @%s -> Alias %5.2f Hz  %s +- %s mV  Last-Grundw. %.3f (%s)  Antwort %s +- %s%s%s" % (
-                r["tag"], r["f"], "47" if r["tag"] == "K213b" else "50", r["fa"], fmt(r["a"]), fmt(r["se"]), r["c"], r["src"],
+                r["tag"], r["f"], "47" if r["tag"] == "K213b" else "50", r["fa"], fmt(r["a"]), fmt(r["se"]), r["c"], r["src"] + (
+                    ", dt-Streuung %s ms" % fmt(r["dtsd"], 2) if r.get("dtsd") is not None else ""),
                 fmt(r.get("resp")), fmt(r.get("resp_se")), ("  |Z|~%s mOhm" % fmt(z, 0)) if math.isfinite(z) else "",
-                "" if r["sig"] else "  (nicht signifikant)")
+                "" if r["sig"] else ("  (Last zu schwach - nicht verwendet)" if not r["gen_ok"]
+                                     else "  (nicht signifikant)"))
             L.append(line); S.append(line)
         if kref:
             line = "  Bezug (Gleichstrom): %s, Hub %.2f +- %.2f mV je voll belastetem Kern%s" % (
@@ -1263,6 +1318,11 @@ def analyse(cdir):
                 lo = sg[0]; tol = max(0.10, 3 * lo["resp_se"])
                 checks.append(("Kalibrierung: Methode bestaetigt - tiefste Frequenz %g Hz trifft Gleichstrom-Bezug (Antwort %.3f, Soll 1 +- %.2f)"
                                % (lo["f"], lo["resp"], tol), abs(lo["resp"] - 1) <= tol))
+            jit = [fmt(C[t]["dt_sd_ms"], 2) for t in ("P50", "P47", "I50") if t in C and "dt_sd_ms" in C[t]]
+            if jit:
+                line = ("  Abtast-Zeitstreuung P50/P47/I50: %s ms (falls deutlich groesser als in den K-Laeufen, daempft sie Linien"
+                        " >300 Hz bei Musik staerker als kalibriert)" % "/".join(jit))
+                L.append(line); S.append(line)
             for f_ in (500.0, 1000.0):
                 h_ = resp_at(krows, f_)
                 line = "  Antwort bei %g Hz: %s" % (f_, ("%.2f (gemessen, interpoliert)" % h_) if h_ is not None else "nicht im Messbereich")
@@ -1273,10 +1333,13 @@ def analyse(cdir):
                              "     waechst mit der Frequenz (ein mittelnder Sensor kann nur daempfen). |Z| = R_DC x Antwort (Annahme: Sensor flach)."):
                     L.append(line); S.append(line)
         k1 = next((r for r in krows if r["tag"] == ktag(KAL_HI)), None); k2 = next((r for r in krows if r["tag"] == "K213b"), None)
-        if k1 and k2 and "resp" in k1 and "resp" in k2 and k1["sig"] and k2["sig"]:
-            tol = max(0.10, 3 * math.hypot(k1["resp_se"], k2["resp_se"]))
-            checks.append(("Kalibrierung: 213 Hz bei 50 und 47 Hz Abtastung gleich (%.3f / %.3f, Toleranz %.2f)" % (
-                k1["resp"], k2["resp"], tol), abs(k1["resp"] - k2["resp"]) <= tol))
+        if k2:
+            if k1 and "resp" in k1 and "resp" in k2 and k1["sig"] and k2["sig"]:
+                tol = max(0.10, 3 * math.hypot(k1["resp_se"], k2["resp_se"]))
+                checks.append(("Kalibrierung: 213 Hz bei 50 und 47 Hz Abtastung gleich (%.3f / %.3f, Toleranz %.2f)" % (
+                    k1["resp"], k2["resp"], tol), abs(k1["resp"] - k2["resp"]) <= tol))
+            else:
+                checks.append(("Kalibrierung: 47-Hz-Gegenprobe K213b auswertbar (K213 und K213b signifikant)", False))
         nsig = sum(1 for r in krows if r["sig"]); checks.append(("Kalibrierung: Stuetzstellen signifikant (%d von %d)" % (
             nsig, len(krows)), nsig == len(krows)))
         for t in ("P50", "I50"):
@@ -1306,7 +1369,7 @@ def analyse(cdir):
         va, vb = M["I50"]["var_hf"], M["I50b"]["var_hf"]; ua, ub = M["I50"]["var_hf_se"], M["I50b"]["var_hf_se"]
         lim = 3 * math.hypot(ua, ub) if math.isfinite(ua) and math.isfinite(ub) else float("nan")
         checks.append(("Ruhe-Schwankung reproduzierbar (Varianz I50 %.2f / I50b %.2f mV^2, Differenz %.2f <= 3 Standardfehler %.2f)" % (
-            va, vb, abs(vb - va), lim), abs(vb - va) <= lim if math.isfinite(lim) else 0.75 <= vb / va <= 1.33))
+            va, vb, abs(vb - va), lim), abs(vb - va) <= lim if math.isfinite(lim) else (va > 0 and 0.75 <= vb / va <= 1.33)))
     # Mechanismus: Prozessor oder Netzwerk-Hardware?
     mech = mechanism(M, C, params) if mode != "widerstand" else None
     if mech is not None:
@@ -1571,8 +1634,22 @@ def selftest():
             fs_ += onoff_seg(k * per, k * per + d_ * per, f_)
         got = onoff_rms(fs_, 0.0, int(10 * f_) * per); soll = math.sqrt(2) / math.pi * math.sin(math.pi * d_)
         chk(abs(got - soll) < 1e-6, "Grundwelle 0/1-Last %g Hz, Tastv. %.0f %%: %.4f (Soll %.4f)" % (f_, 100 * d_, got, soll))
-    sg2 = SquareGen(1013.0, "t"); sg2.start(); time.sleep(2.0); sg2.stop_ev.set(); sg2.join(10); g2 = sg2.stats()
-    chk(math.isfinite(g2["grund_rms"]) and g2["grund_rms"] > 0.2, "Rechtecklast 1013 Hz laeuft, Grundwelle %.3f (ideal 0,450; hier Test-VM)" % g2["grund_rms"])
+    sg2 = SquareGen(1013.0, "t"); sg2.start(); time.sleep(0.5); w0 = H.now_boot(); time.sleep(2.2); w1 = H.now_boot()
+    sg2.stop_ev.set(); sg2.join(10); rms2, j2, nb2 = sg2.window_fund(w0, w1, 1.0)
+    chk(math.isfinite(rms2) and rms2 > 0.1 and nb2 == 2, "Rechtecklast 1013 Hz im Fenster: Grundwelle %.3f, %d Taktspruenge (Test-VM)" % (rms2, j2))
+    # Taktsprung: blockweise Auswertung (wie Welch) bleibt nahe am Ideal, Gesamt-Koeffizient wuerde einbrechen
+    f_ = 1013.0; per = 1 / f_; ts_ = []; t_ = 0.0; slip = False
+    while t_ < 40.0:
+        if not slip and t_ > 12.0:
+            t_ += 0.0016; slip = True                      # ein Sprung von 1,6 ms mitten im Lauf
+        ts_ += [(t_, True), (t_ + per / 2, False)]; t_ += per
+    blk, jj, nbk = window_fund(ts_, f_, 0.0, 40.0, 10.0); whole, _, _ = window_fund(ts_, f_, 0.0, 40.0, 40.0)
+    # Gegenprobe der Kernidee: Spannung = Hub x Last an denselben Abtastzeiten (mit Abtast-Streuung 0,1 ms)
+    tim = [i / 50.0 + random.gauss(0, 1e-4) for i in range(int(40 * 50))]
+    lx = load_at(ts_, tim); vv_ = [-25.0 * x_ + random.gauss(0, 0.5) for x_ in lx]
+    fq_, pq_ = welch(vv_, 50.0); a_v = peak_rms({"f": fq_, "psd": pq_}, alias(f_, 50.0)); a_x = sampled_fund(ts_, f_, tim)
+    chk(abs(a_v / (25.0 * a_x) - 1) < 0.05 and jj == 1 and whole < 0.6 * SQ_FUND,
+        "Taktsprung 1,6 ms + Abtast-Streuung: Antwort %.3f (Soll 1,000); Gesamt-Koeffizient waere %.3f statt 0,450" % (a_v / (25.0 * a_x), whole))
     Cr = {"R50": {"gen": {"toggles": tog}, "pmic": rows, "logger_start": t0, "v": vv, "t": tt, "fs": fs_ if False else 50.0}}
     Mk = {"I50": None, "I47": None}
     def mk2(fs, fa, rms, n=int(180 * 50)):

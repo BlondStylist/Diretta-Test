@@ -29,11 +29,14 @@ Ergebnisse: `~/ext5v/results/...` mit `SHA256SUMS`, Kurzbericht `kurz.txt`. Alle
 Wichtige Grenzen der Spannungsmessung: ADC-Raster 1,34 mV, Absolutfehler ca. +-1,5 %, 50 Hz Abtastung
 (Ereignisse < 20 ms unsichtbar, Quellen nahe Vielfachen von 50 Hz fallen auf 0 Hz).
 
-Kalibrierungen in `vschwank.py` (v1.3, geraetespezifisch, bei jeder Reihe neu):
-1. **Frequenzgang** `K3..K313` (+ `K213b` @47 Hz): identische Rechtecklast CPU0 bei 3,1-313 Hz -> Mittelungsfenster T des
-   PMIC-Sensors (Boxcar-Modell), H(f). Gemessene Linien-Amplituden werden mit 1/H(f) korrigiert (nur H >= 0,2, als Modell markiert).
-   Erst danach ein „keine Spitze" als „keine Stoerung" deuten.
-2. **Lastempfindlichkeit**: Hub je voll belastetem Kern aus der Grundwelle (Gegenprobe zur hostmess-Laststufe).
+Kalibrierungen in `vschwank.py` (v1.4.4, geraetespezifisch, bei jeder Reihe neu):
+1. **Frequenzgang** `K3..K1013` (+ `K213b` @47 Hz, v1.4.4): identische Rechtecklast CPU0 bei 3,1-1013 Hz, also ueber
+   Diretta-Takt (500 Hz) und 1. Oberwelle (1000 Hz). Keine Modellannahme: die Last wird aus den Schaltzeiten an den
+   **echten Logger-Zeitpunkten** rekonstruiert und durch dieselbe Welch/peak_rms-Kette geschickt wie die Spannung
+   (Taktspruenge, Frequenzabweichung, Faltung, Abtast-Streuung kuerzen sich heraus). Antwort = gemessen / (Hub_DC x Last),
+   Bezug Hub_DC = Gleichstrom-Laststufe R50 derselben Last; Pruefung: tiefste Frequenz muss 1,00 ergeben.
+   Steigt die Antwort mit f, waechst der Innenwiderstand der Versorgung (Target/iFi 03.10.: x2,5 bis 313 Hz).
+2. **Lastempfindlichkeit**: Hub je voll belastetem Kern = R50 (Gleichstrom), mit Standardfehler.
 3. **Drift-Klammerung** `I50 / I50m / I50b`: Mittelwerte relativ zur zeitlich interpolierten Ruhe; Spanne der Klammern <= 3 mV gefordert.
 4. **Netzbrumm/Fremdfrequenzen** 50/100/150 Hz (Alias nur bei 47 Hz sichtbar) sowie 60/120 Hz (bei 50 und 47 Hz sichtbar).
 5. **Mechanismus** `C47/C47x` (v1.3): CPU0-Wecker mit Diretta-Takt @47 Hz. Soll-Rechenzeit je Zyklus = Diretta-Threads +
