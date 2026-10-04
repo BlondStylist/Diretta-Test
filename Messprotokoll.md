@@ -201,3 +201,17 @@ Diretta-Empfang 500,1 Pak/s × 1537 B. P50 sd 5,85 mV / Varianz 28,66 mV²; I50 
 - CPU3 (IRQs): USB-Controller xhci **auch ohne Musik 500 IRQ/s** (irq-Thread 6 ms/s) → erklaert die dauerhafte Ruhe-Linie nahe
   1 kHz (12,94 Hz @47 = Oberwelle 2×500) und den 0,1-0,5-Hz-Anteil @50 Hz. Bei Musik 2050 IRQ/s, 45 ms/s Rechenzeit.
 - nohz_full wirkt: CPU2 Ruhe nur 8 Timer-IRQ/s.
+
+## Unterbrechungen Host (kernrausch.py 1.0, 04.10.2026 13:54, passiv; osnoise/timerlat im Kernel NICHT vorhanden)
+
+| CPU | Ruhe IRQ/s | Musik IRQ/s (Hauptquellen) | Musik belegt |
+|---|---|---|---|
+| 0 | 1552 | 1984 (arch_timer 1276, IPI 601, xhci 85) | 0,75 % |
+| 1 | 1315 | 1747 | 0,52 % |
+| 2 | **2** | **1518 (end0 1010, IPI-Resched 397, Tick 105)** + NET_RX 505 | 1,02 % |
+| 3 | 102 (IPI 93) | 602 (IPI-Resched 597) | 0,22 % |
+
+- CPU2 bei Musik: `irq/104-eth` FIFO90 990 Akt./s 3,4 ms/s + `syncAlsa` FIFO99 510 Akt./s 8,0 ms/s → zwei Echtzeit-Threads auf
+  einem Kern → Timer-Tick kehrt zurueck (105/s statt 0) = Kandidat A/B „end0-IRQ auf CPU3“ (wie am Target getrennt).
+- CPU3 bei Musik: `syncAlsa` RR10 500 Akt./s + FIFO80 100 Akt./s (auch in Ruhe 100/s); Weckungen per IPI 597/s.
+- Ruhe: CPU2 praktisch still (2 IRQ/s), CPU3 nur syncAlsa 100/s.
