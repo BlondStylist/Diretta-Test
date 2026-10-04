@@ -186,3 +186,18 @@ Diretta-Empfang 500,1 Pak/s × 1537 B. P50 sd 5,85 mV / Varianz 28,66 mV²; I50 
 - Gegenprobe ALSA am Target (96 kHz, laufend): period_size 480 Frames, buffer 1920 (4 Perioden) → **Periodenrhythmus 200 Hz**,
   nicht 480 Hz → Vermutung „480 Hz = ALSA-Periode“ **widerlegt**. Herkunft der ~480-Hz-Linie und der 0,38-Hz-Komponente offen
   (moeglich: Schwebung zwischen 200-Hz-ALSA-Takt (DAC-Takt) und 500-Hz-Diretta-Takt (Pi-Takt); pruefbar mit 48-kHz-Wiedergabe).
+
+## Unterbrechungen Target (kernrausch.py 1.0, 04.10.2026 13:34, passiv; osnoise/timerlat im Kernel NICHT vorhanden)
+
+| CPU | Ruhe IRQ/s (Hauptquellen) | Musik IRQ/s (Hauptquellen) | Musik belegt |
+|---|---|---|---|
+| 0 | 1545 (arch_timer 1070, IPI 454) | 1492 | 0,10 % |
+| 1 | 1305 (arch_timer 843, IPI 461) | 1264 | 0,03 % |
+| 2 | 123 (IPI-Resched 114, Tick 8) | **734 (IPI-Resched 730)** | 0,33 % |
+| 3 | **517 (xhci-USB 500, end0 3)** + Softirq HI 500 | **3083 (xhci 2050, end0 1020)** + Softirq HI 2050, NET_RX 515 | 4,88 % |
+
+- CPU2 (Diretta): Musik `diretta_app_target` FIFO99 500,3 Akt./s (Netz-Zyklus) + 200,0 Akt./s (ALSA-Periode 480 Frames) - Ruhe 100 Akt./s.
+  Weckungen kommen per IPI von CPU3 (IRQ dort, Thread auf CPU2): 730/s.
+- CPU3 (IRQs): USB-Controller xhci **auch ohne Musik 500 IRQ/s** (irq-Thread 6 ms/s) → erklaert die dauerhafte Ruhe-Linie nahe
+  1 kHz (12,94 Hz @47 = Oberwelle 2×500) und den 0,1-0,5-Hz-Anteil @50 Hz. Bei Musik 2050 IRQ/s, 45 ms/s Rechenzeit.
+- nohz_full wirkt: CPU2 Ruhe nur 8 Timer-IRQ/s.
