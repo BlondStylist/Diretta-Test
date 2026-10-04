@@ -173,3 +173,13 @@ Gemessene Antwort auf identische Laststufe (Bezug Gleichstrom R50 = 20,42 ± 0,1
 Antwort bei 500 Hz (interpoliert) 1,27. Ruhe: Linie 12,94 Hz @47 (×46) → Quelle nahe 1 kHz dauerhaft. Musik: 9,64 Hz (2,04 mV) reproduziert.
 Musik-Teil dieses Laufs ungueltig (P50 nur 23 % Wiedergabe → Zyklus 117,7 statt 500 Pak/s erkannt, C47 entfallen);
 ab 1.4.6 wird eine Teilmessung bei Zustandswechsel automatisch wiederholt.
+
+## Target Musik-/Mechanismus-Teil (vschwank.py 1.4.6 target --ohne-kal, 04.10.2026 12:47, 66/66 Pruefungen)
+
+Diretta-Empfang 500,1 Pak/s × 1537 B. P50 sd 5,85 mV / Varianz 28,66 mV²; I50 3,14 / 8,82 → **Zusatzvarianz Wiedergabe 19,8 ± 3,5 mV²**.
+- 500-Hz-Linie (P47) 0,67 ± 0,08 mV (×6 Ruhe); Diretta-Rechenzeit +18,2 µs/Zyklus; erwartet aus C47x 0,53 mV = **78 ± 9 % → Prozessor
+  dominiert** (03.10.: 116 ± 17 %). 1000 Hz 0,95 mV nicht signifikant. Kalibrierte Antwort bei 500 Hz 1,27 (Lauf 03.10. 19:13).
+- **Neu: langsame Komponente 0,38 Hz nur bei Musik** (P50 0,39 Hz 2,80 mV, P47 0,37 Hz 1,20 mV; bei beiden Raten gleich → echt, ~2,6 s Periode).
+- Linie P47 9,64 Hz (2,06 mV) + P50 20,41/19,63 Hz: Quellsuche findet **479,55-479,68 Hz** (Alias 20,38 @50 / 9,62 @47) →
+  wahrscheinlich Quelle ~480 Hz bei Wiedergabe (Ursache offen; Kandidat ALSA-/USB-Periodenrhythmus: 96000/200 = 480).
+- Ruhe: 12,94 Hz @47 (×37) wieder vorhanden (Quelle nahe 1 kHz).
