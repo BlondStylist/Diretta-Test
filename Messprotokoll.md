@@ -215,3 +215,30 @@ Diretta-Empfang 500,1 Pak/s × 1537 B. P50 sd 5,85 mV / Varianz 28,66 mV²; I50 
   einem Kern → Timer-Tick kehrt zurueck (105/s statt 0) = Kandidat A/B „end0-IRQ auf CPU3“ (wie am Target getrennt).
 - CPU3 bei Musik: `syncAlsa` RR10 500 Akt./s + FIFO80 100 Akt./s (auch in Ruhe 100/s); Weckungen per IPI 597/s.
 - Ruhe: CPU2 praktisch still (2 IRQ/s), CPU3 nur syncAlsa 100/s.
+
+## Test 1: USB-Unterbrechungen Target (04.10.2026 18:30-19:10, usbmon + /proc/interrupts, je 10 s bzw. 5 s)
+
+Quelle bestimmt mit usbmon (Callbacks je Geraet:Endpunkt, Bus 3, Audiolab = Geraet 6 bzw. 5 nach Neustart):
+
+| Zustand | Kanal | /s | Bedeutung |
+|---|---|---|---|
+| ohne Musik | Ii:4 (HID, Interface 4) | 500 | Audiolab meldet sich als Tastatur (Medientasten, `Handlers=kbd`); der Kernel-Tastaturtreiber oeffnet es, Abfrage alle 2,000 ms, Inhalt immer `00` |
+| mit Musik | Zo:1 Audiodaten | 1200 | 96 kHz S32, 96 B je 125-us-Paket, 6,67 Pakete je URB |
+| mit Musik | Zi:1 Taktrueckmeldung | 1000 | ASYNC-Feedback 1 ms, Wert ~12,0006 Frames/125 us |
+| mit Musik | Ii:4 HID | 500 | faellt immer in ohnehin vorhandene IRQs (2-ms-Raster auf 1-ms-Feedback) |
+
+Massnahmen und Wirkung:
+
+| Massnahme | xhci ohne Musik | xhci mit Musik | CPU2 / CPU3 mit Musik |
+|---|---|---|---|
+| vorher | 500/s | 2053/s | 734 / 3083 /s |
+| HID-Interface 4 abgekoppelt (udev-Regel) | **0/s** | 2053/s | - |
+| zusaetzlich `snd_usb_audio lowlatency=0` | 0/s | 2053/s | 733 / 3087 /s (keine Wirkung) -> zurueckgesetzt |
+
+Warum die Datenbuendel nicht groesser werden koennen (Kernel `sound/usb/endpoint.c`, data_ep_set_params):
+Pakete je URB <= 2^syncinterval = 8 (Feedback-Intervall des DAC, 1 ms, Firmware) und die ALSA-Periode
+(480 Frames, von Diretta vorgegeben) wird auf ceil(Pakete_je_Periode/8) = 6 URBs verteilt -> 80 Frames je URB -> 1200/s.
+Theoretisches Minimum ~1140/s (Rand 12 % im Treiber). `lowlatency` aendert nur den Ort des Nachschiebens, nicht die Groesse.
+
+Dauerhaft am Target: `/etc/udev/rules.d/90-audiolab-ohne-hid.rules`
+(ACTION=="bind", DRIVER=="usbhid", bInterfaceNumber 04, 2622:0041 -> unbind). Rueckweg: Datei loeschen, Neustart.
