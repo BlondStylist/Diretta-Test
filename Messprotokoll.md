@@ -183,3 +183,6 @@ Diretta-Empfang 500,1 Pak/s × 1537 B. P50 sd 5,85 mV / Varianz 28,66 mV²; I50 
 - Linie P47 9,64 Hz (2,06 mV) + P50 20,41/19,63 Hz: Quellsuche findet **479,55-479,68 Hz** (Alias 20,38 @50 / 9,62 @47) →
   wahrscheinlich Quelle ~480 Hz bei Wiedergabe (Ursache offen; Kandidat ALSA-/USB-Periodenrhythmus: 96000/200 = 480).
 - Ruhe: 12,94 Hz @47 (×37) wieder vorhanden (Quelle nahe 1 kHz).
+- Gegenprobe ALSA am Target (96 kHz, laufend): period_size 480 Frames, buffer 1920 (4 Perioden) → **Periodenrhythmus 200 Hz**,
+  nicht 480 Hz → Vermutung „480 Hz = ALSA-Periode“ **widerlegt**. Herkunft der ~480-Hz-Linie und der 0,38-Hz-Komponente offen
+  (moeglich: Schwebung zwischen 200-Hz-ALSA-Takt (DAC-Takt) und 500-Hz-Diretta-Takt (Pi-Takt); pruefbar mit 48-kHz-Wiedergabe).
