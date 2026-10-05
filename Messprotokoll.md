@@ -241,4 +241,8 @@ Pakete je URB <= 2^syncinterval = 8 (Feedback-Intervall des DAC, 1 ms, Firmware)
 Theoretisches Minimum ~1140/s (Rand 12 % im Treiber). `lowlatency` aendert nur den Ort des Nachschiebens, nicht die Groesse.
 
 Dauerhaft am Target: `/etc/udev/rules.d/90-audiolab-ohne-hid.rules`
-(ACTION=="bind", DRIVER=="usbhid", bInterfaceNumber 04, 2622:0041 -> unbind). Rueckweg: Datei loeschen, Neustart.
+`ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceNumber}=="04", ATTRS{idVendor}=="2622", ATTRS{idProduct}=="0041", ATTR{authorized}="0"`
+Erste Fassung (ACTION=="bind" + unbind) griff nur bei einem von zwei Neustarts: beim Booten bindet usbhid
+teils vor udevd, das Nachholen (coldplug) sendet nur "add". `authorized=0` beim add-Ereignis sperrt das
+Interface unabhaengig von der Reihenfolge; nach Neustart geprueft: authorized=0, kein Treiber, xhci 0/s.
+Rueckweg: Datei loeschen, `echo 1 > /sys/bus/usb/devices/3-2.3.1.4:1.4/authorized`.
