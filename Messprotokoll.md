@@ -269,3 +269,33 @@ Sende-Gleichmaessigkeit, gemessen als Ankunftsabstand der Audiopakete am Target
 
 Ergebnis: IRQs werden nur verschoben (Summe gleich), Paket-Timing innerhalb der Block-Streuung gleich.
 Keine messbare Wirkung -> Ausgangszustand `2-3` bleibt (keine unbegruendete Aenderung).
+
+## Test 3: 48-kHz-Wiedergabe am Target (vschwank.py 1.4.6 target --ohne-kal, 05.10.2026 14:08, 65/66 Pruefungen)
+
+Takte bei 48 kHz/24 Bit (S32_LE) gegen 96 kHz: ALSA period 240 (statt 480) Frames = weiterhin 5 ms / 200 Hz,
+Zo 1200/s, Zi 1000/s, xhci 2054/s, Diretta 500 Pak/s - **alle Takte zeitbasiert, unabhaengig von der Abtastrate**;
+nur die Nutzlast halbiert sich (USB 48 statt 96 B je 125 us, Diretta-Rahmen 769 statt 1537 B).
+
+| Groesse | 96 kHz (04.10.) | 48 kHz (05.10.) |
+|---|---|---|
+| Ruhe I50 sd / Varianz | 3,14 mV / 8,82 mV² | 1,51 mV / 2,09 mV² |
+| Wiedergabe P50 sd / Varianz | 5,85 mV / 28,66 mV² | 6,74 mV / 32,62 mV² |
+| Zusatzvarianz Wiedergabe | 19,8 ± 3,5 mV² | 30,5 ± 3,6 mV² |
+| 500-Hz-Linie (P47) | 0,67 ± 0,08 mV | 0,99 ± 0,10 mV |
+| Diretta-Rechenzeit je Zyklus | +18,2 us | +17,5 us |
+| Prozessor-Anteil (ueber C47x) | 78 ± 9 % | 74 ± 7 % |
+| Linie 9,64 Hz @47 | 2,06 mV | 2,23 mV (gleiche Frequenz) |
+| langsame Komponente 0,1-0,5 Hz P47 | 1,20 mV (0,37 Hz) | 1,16 mV |
+
+Bewertung:
+- Halbe Nutzlast senkt die 500-Hz-Linie nicht -> bestaetigt: das Aufwachen der CPU je Diretta-Zyklus dominiert,
+  nicht die Datenmenge. Absolutwerte zwischen den Tagen nicht direkt vergleichbar (Ruhe heute halb so unruhig).
+- [FAIL] C47-Linearitaet x0,65 (Grenze 0,67): kleine Last erzeugt weniger als linear erwartet -> Prozessor-Anteil liegt
+  zwischen 47 % (direkt C47 0,47 / 0,99 mV) und 74 % (skaliert ueber C47x). Aussage "Prozessor dominiert" daher nur
+  als Bereich 47-74 % belastbar.
+- 9,64-Hz-Linie @47 frequenzgleich bei 48 und 96 kHz -> Quelle haengt nicht am DAC-Abtasttakt; ALSA-Periode (200 Hz)
+  als Quelle erneut ausgeschlossen. Gegenstueck @50 Hz (20,4 Hz) diesmal nicht signifikant -> Quellfrequenz (~479,6 Hz)
+  nicht eindeutig; offen.
+- P50 0,1-0,5 Hz (3,39 mV, Spitze 0,29 Hz) ist ueberwiegend Alias der Diretta-Oberwellen: 500,1 Hz x k bei 50 Hz
+  Abtastung -> k x 0,096 Hz (Alias-Test: 1000,19 Hz -> 0,20 Hz SPITZE). Echte langsame Komponente nur aus P47:
+  ~1,2 mV, bei 48 und 96 kHz gleich, Ursache offen.
