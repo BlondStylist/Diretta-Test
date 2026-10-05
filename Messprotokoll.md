@@ -246,3 +246,26 @@ Erste Fassung (ACTION=="bind" + unbind) griff nur bei einem von zwei Neustarts: 
 teils vor udevd, das Nachholen (coldplug) sendet nur "add". `authorized=0` beim add-Ereignis sperrt das
 Interface unabhaengig von der Reihenfolge; nach Neustart geprueft: authorized=0, kein Treiber, xhci 0/s.
 Rueckweg: Datei loeschen, `echo 1 > /sys/bus/usb/devices/3-2.3.1.4:1.4/authorized`.
+
+## Test 2: end0-IRQ 104 am Host auf CPU3 (05.10.2026, Musik 96 kHz, je 10 s bzw. 20 s)
+
+Ausgangslage: Affinitaet `2-3`, effektiv immer CPU2; kein Dienst setzt sie (irqbalance/rtirq inaktiv).
+Diretta Host: syncAlsa FF99 auf CPU2 (CpuSend=2), FF80 + RR10 auf CPU3; irq/104 FF90 folgt der IRQ-Affinitaet.
+
+| IRQ 104 | CPU0 | CPU1 | CPU2 | CPU3 | Summe CPU2+3 |
+|---|---|---|---|---|---|
+| 2-3 (CPU2) | 1986 | 1930 | 1518 | 602 | 2120 /s |
+| 3 | 1886 | 2024 | 507 | 1613 | 2120 /s |
+
+Sende-Gleichmaessigkeit, gemessen als Ankunftsabstand der Audiopakete am Target
+(tcpdump end0, > 1000 B, Abstaende 1-3 ms, ABAB je 20 s, ~9950 Abstaende je Block):
+
+| IRQ 104 | SD [us] | mittl. Abw. von 2000 us [us] | P99,9 [us] | Max [us] |
+|---|---|---|---|---|
+| 3 | 54,34 | 7,01 | 2026 | 2030 |
+| 2-3 | 52,68 | 6,92 | 2025 | 2027 |
+| 3 | 50,28 | 6,72 | 2025 | 2028 |
+| 2-3 | 53,25 | 6,90 | 2026 | 2067 |
+
+Ergebnis: IRQs werden nur verschoben (Summe gleich), Paket-Timing innerhalb der Block-Streuung gleich.
+Keine messbare Wirkung -> Ausgangszustand `2-3` bleibt (keine unbegruendete Aenderung).
