@@ -1,110 +1,69 @@
-# Diretta Audio Chain Optimization – Abschluss (Test Series A/B/C)
+# Diretta-Kette: Abschluss Testserie 1–3
 
-**Datum**: 2026-10-06  
-**Status**: Abgeschlossen  
-**Zweig**: claude/zealous-ride-1fn94u (seit PR #2 rebasiert)
+Stand: 06.10.2026 · Quelle aller Zahlen: `Messprotokoll.md` (Abschnitte Test 1–3) · Branch `claude/zealous-ride-1fn94u`
 
----
+Host 192.168.178.71, Target 172.20.0.2 (Raspberry Pi 5), DAC Audiolab 8300CD (USB, ASYNC).
 
-## Zusammenfassung der durchgeführten Arbeiten
+## Test 1: USB-Unterbrechungen am Target (04.10.2026)
 
-### Test 1: USB HID-Unterbrechungen (Host Pi 192.168.178.71)
-**Problemstellung**: Audiolab 8300CD präsentiert sich als USB-Keyboard (Lautstärkeregler), was zu automatischem HID-Polling führt.
+- Ursache: Der Audiolab meldet sich zusätzlich als Tastatur (Medientasten). Der Kernel öffnet Interface 4 und fragt es alle 2,000 ms ab (500/s, Inhalt immer `00`).
+- Maßnahme: udev-Regel `/etc/udev/rules.d/90-audiolab-ohne-hid.rules` setzt beim `add`-Ereignis `authorized=0` für Interface 4 (VID 2622, PID 0041).
+- Die erste Fassung (`bind` + unbind) griff nur bei einem von zwei Neustarts, weil usbhid beim Booten teils vor udevd bindet. Die `add`-Variante wirkt unabhängig davon und ist nach Neustart geprüft.
+- Rückweg: Datei löschen, `echo 1 > /sys/bus/usb/devices/3-2.3.1.4:1.4/authorized`.
 
-**Lösung implementiert**: udev-Regel mit `ATTR{authorized}="0"` auf add-event  
-**Ergebnis**: 
-- Ohne Musik: ~500 Interrupts/s eliminiert
-- Mit Musik: Kein Effekt (bereits auf xhci-Basislast)
-- Zuverlässig über Neustarts wirksam (coldplug-Problem gelöst)
+| Zustand | xhci ohne Musik | xhci mit Musik |
+|---|---|---|
+| vorher | 500/s | 2053/s |
+| HID-Interface 4 gesperrt | **0/s** | 2053/s |
+| zusätzlich `snd_usb_audio lowlatency=0` | 0/s | 2053/s (keine Wirkung, zurückgesetzt) |
 
-**Commit**: PR #2 (merged), 02.10–03.10.2026
+Mit Musik bringt die Sperre nichts, da die HID-Abfragen ohnehin in vorhandene Interrupts fallen. Die Bündelgröße der Audio-URBs (1200/s) ist durch das 1-ms-Feedback des DAC und die ALSA-Periode (480 Frames) festgelegt. Das theoretische Minimum liegt bei ca. 1140/s.
 
----
+## Test 2: end0-IRQ 104 am Host auf CPU3 (05.10.2026, Musik 96 kHz)
 
-### Test 2: end0 IRQ-Affinität (Target Pi 172.20.0.2)
-**Hypothese**: CPU-Affinity von end0 (Host-Sender-CPU2) zu CPU3 (Target-Empfänger) verschieben würde Paketlaufzeit verbessern.
+Ausgangslage: Affinität `2-3`, effektiv CPU2 (dort läuft auch syncAlsa FF99, CpuSend=2). Variante: Affinität `3`.
 
-**Messergebnis**:
-- **Konfiguration A** (affinity=2-3): Paket-SD ~50-54µs
-- **Konfiguration B** (affinity=3): Paket-SD ~50-54µs → **Kein signifikanter Unterschied**
-- IRQs wurden redistributiert, nicht reduziert
-
-**Entscheidung**: Status quo beibehalten (2-3 Affinität)  
-**Erkenntnis**: IRQ-Affinity verbessert Timing nicht; Packet-Variabilität ist durch Diretta-Protokoll und DAC-Feedback-Interval (1ms) vorgegeben.
-
-**Commit**: PR #3 (draft), 03.10–04.10.2026
-
----
-
-### Test 3: 48kHz-Komponentenanalyse (Target Pi)
-**Kontext**: Roon-Upsampling (96kHz) ausgeschaltet → native 48kHz-Messung durchgeführt.
-
-**Gemessene Werte**:
-| Komponente | 96kHz | 48kHz | Änderung |
+| IRQ 104 | CPU2 | CPU3 | Summe CPU2+3 |
 |---|---|---|---|
-| 500Hz-Linie | 0.67mV | 0.99mV | +48% (frequenzunabhängig) |
-| Diretta-Rechenzeit | 18.2µs | 17.5µs | -3.8% |
-| CPU-Mechanismus-Beitrag | 78±9% | 74±7% | Stabil |
-| 9.64Hz Alias (480Hz) | 2.18mV | 2.23mV | ±2% (frequenzinvariant) |
-| Langsame 0.38Hz Komponente | ~1.2mV | ~1.2mV | Konstant (Ursprung ungeklärt) |
+| 2-3 (CPU2) | 1518/s | 602/s | 2120/s |
+| 3 | 507/s | 1613/s | 2120/s |
 
-**Testabdeckung**: 
-- 66 Messungen (8 Bedingungen: P50/P47 Musik, I50/I47 Ruhe, C47/C47x Mechanismus, I50m/I50b Stabilität)
-- **1 Fehler**: C47-Linearitätstest (x0.65 vs. Schwelle x0.67) – Mechanismus-Beitrag an Grenzen der Auflösung
+Paketabstand am Target (tcpdump, ABAB je 20 s, ca. 9950 Abstände je Block):
 
-**Commit**: PR #3 (draft), 04.10–05.10.2026
+| IRQ 104 | SD [µs] | mittl. Abw. von 2000 µs [µs] |
+|---|---|---|
+| 3 | 54,34 | 7,01 |
+| 2-3 | 52,68 | 6,92 |
+| 3 | 50,28 | 6,72 |
+| 2-3 | 53,25 | 6,90 |
 
----
+Ergebnis: Die IRQs werden nur verschoben, die Summe bleibt gleich, das Paket-Timing liegt innerhalb der Blockstreuung. Keine messbare Wirkung, deshalb bleibt `2-3`.
 
-## Zentrale Erkenntnisse
+## Test 3: 48 kHz gegen 96 kHz am Target (05.10.2026, vschwank.py 1.4.6, 65/66 Prüfungen)
 
-### Pi-Seite (Host/Target zusammengefasst)
+Alle Takte sind zeitbasiert und unabhängig von der Abtastrate (ALSA-Periode 5 ms / 200 Hz, Zo 1200/s, Zi 1000/s, xhci 2054/s, Diretta 500 Paket/s). Nur die Nutzlast halbiert sich.
 
-1. **500Hz-Linie (Netzfrequenz-Harmonic)**
-   - Ursache: CPU-Wakeup-Mechanismus (78% bei 96kHz, 74% bei 48kHz)
-   - Frequenzunabhängig: `0.67mV→0.99mV` folgt nicht 96/48-Ratio (würde 1.33mV→0.67mV sein)
-   - **Kein weiterer Hebel auf Pi-Seite identifiziert**
+| Größe | 96 kHz (04.10.) | 48 kHz (05.10.) |
+|---|---|---|
+| Ruhe I50 sd / Varianz | 3,14 mV / 8,82 mV² | 1,51 mV / 2,09 mV² |
+| Wiedergabe P50 sd / Varianz | 5,85 mV / 28,66 mV² | 6,74 mV / 32,62 mV² |
+| Zusatzvarianz Wiedergabe | 19,8 ± 3,5 mV² | 30,5 ± 3,6 mV² |
+| 500-Hz-Linie (P47) | 0,67 ± 0,08 mV | 0,99 ± 0,10 mV |
+| Diretta-Rechenzeit je Zyklus | +18,2 µs | +17,5 µs |
+| Prozessor-Anteil (über C47x) | 78 ± 9 % | 74 ± 7 % |
+| Linie 9,64 Hz @47 | 2,06 mV | 2,23 mV |
+| langsame Komponente 0,1–0,5 Hz (P47) | 1,20 mV (0,37 Hz) | 1,16 mV |
 
-2. **9.64Hz Alias-Komponente (480Hz-Komponent bei 96kHz)**
-   - Konsistent über beide Abtastraten
-   - Nicht DAC-getrieben
-   - Ursprung: Vermutlich Diretta-Netzwerk-Timing oder ALSA-Periodstruktur
+Bewertung:
+- Halbe Nutzlast senkt die 500-Hz-Linie nicht. Das Aufwachen der CPU je Diretta-Zyklus (500 Hz) bestimmt sie, nicht die Datenmenge. Die Absolutwerte der beiden Tage sind nicht direkt vergleichbar (Ruhe war am 05.10. halb so unruhig).
+- Prüfung gescheitert: C47-Linearität ×0,65 (Grenze 0,67). Der Prozessor-Anteil ist daher nur als Bereich 47–74 % belastbar, nicht als "dominiert".
+- Die 9,64-Hz-Linie hat bei 48 und 96 kHz dieselbe Frequenz und hängt nicht am DAC-Takt. Die ALSA-Periode (200 Hz) ist als Quelle ausgeschlossen. Die Quellfrequenz (ca. 479,6 Hz) ist nicht eindeutig, die Herkunft bleibt offen.
+- Die langsame Komponente (ca. 1,2 mV bei P47) ist bei 48 und 96 kHz gleich, die Ursache ist offen. Die P50-Anteile von 0,1–0,5 Hz sind überwiegend Alias der Diretta-Oberwellen.
 
-3. **Unterbrechungs-Optimierung**
-   - HID-Sperre: 500/s eliminiert (ohne Musik)
-   - IRQ-Affinität: Kein messbarer Effekt
-   - **Grenzfall erreicht**: Weitere Optimierungen erfordern Versorgungslösung
+## Fazit und nächster Schritt
 
-### Nächster Schritt (empfohlen, nicht durchgeführt)
+- Wirksam war nur die HID-Sperre (Ruhe-Interrupts 500/s → 0/s). IRQ-Affinität und `lowlatency` bringen nichts.
+- Für die 500-Hz-Linie gibt es auf Pi-Seite keinen weiteren belegten Hebel.
+- Nächster Schritt: Vorher/Nachher-Messung am Host, sobald dort das iFi Elite 5 V/5 A angeschlossen ist.
 
-**Host-Seite Vorher/Nachher mit iFi Elite 5V/5A Stromversorgung**
-- Sobald iFi Elite an Host (192.168.178.71) angeschlossen ist
-- Baseline + Musiklast unter identischen Bedingungen
-- Ziel: Quantifizierung des Stromversorgungs-Effekts auf Spektrum
-
----
-
-## Dokumentation
-
-Alle Messwerte, Rohdaten und Analyse-Ergebnisse sind in folgenden Dateien gespeichert:
-
-- **Messprotokoll.md**: Zentrale Ergebnisse-Tabellen (02.10–05.10.2026)
-- **vschwank.py v1.4.6**: Target-Spannungs-Analyse-Tool (C47/C47x-Modus)
-- **kernrausch.py v1.0**: Interrupt-Zähler (/proc/interrupts, /proc/softirqs)
-- **hostmess.py**: Gemeinsame Sampling-Funktionen (Ethernet, ALSA)
-- **PR #2** (merged): USB-HID-Test + udev-Lösung
-- **PR #3** (draft): Test 1–3 vollständige Ergebnisse
-
----
-
-## Abschließende Bemerkung
-
-Die Messungen erfolgten nach dem vorgegebenen rigorosen Protokoll:
-✅ Recherche → Analyse → Planung → Korrektur → Optimierung → Verifikation → Problemidentifikation → Korrektur → Kodierung → Selbstkritik → Korrektur → Verifikation → 4×Debugging → Externe Kontrolle → 4×Korrektur → Präsentation
-
-**Alle Messungen sind real, exakt und verifizierbar. Es wurden keine Schätzungen oder Erfindungen durchgeführt.**
-
----
-
-**Status Vollständigkeit**: Drei Optimierungstests erfolgreich durchgeführt und dokumentiert.  
-**Bereitschaft für Folgephase**: Host-Seite Stromversorgungs-Test kann jederzeit beginnen.
+Werkzeuge: `vschwank.py` 1.4.6, `kernrausch.py` 1.0, `hostmess.py`. PRs: #2 (gemerged, Test 1), #3 (Draft, Tests 1–3).
